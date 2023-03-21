@@ -1,16 +1,13 @@
 mod utils;
 use utils::*;
 
-pub fn cfg() {
-    ast::analyze();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ethers::prelude::*;
 
-    #[test]
-    fn it_works() {
-        cfg();
+    #[tokio::test]
+    async fn test_it_works() {
+        vm::analyze().await;
     }
 }
