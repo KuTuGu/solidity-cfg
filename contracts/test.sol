@@ -2,27 +2,35 @@
 pragma solidity >=0.8.0;
 
 import "../lib/forge-std/src/Test.sol";
+import "./outer.sol";
 
 contract A is Test {
     D d;
+    O o;
 
-    function setUp() public {
+    constructor() {
         d = new D();
+        o = new O();
     }
 
     function entry(uint _a, uint _b) external {
-        for (uint i; i < 5; ++i) {
-            this.mid(_a, _b);
+        for (uint i; i < 2; ++i) {
+            _mid(_add(_a, _b));
         }
     }
 
-    function mid(uint _a, uint _b) external out(_b) {
+    function _mid(uint _a) internal out(_a) {
         console.log(_a);
+    }
+
+    function _add(uint _a, uint _b) internal pure returns (uint) {
+        return _a + _b;
     }
 
     modifier out(uint _c) {
         _;
         d.d(_c);
+        o.o(_c);
     }
 }
 
@@ -32,13 +40,9 @@ interface ID {
 
 contract D is ID {
     function d(uint _d) external {
-        bool success;
-        address a = address(0);
-
-        assembly {
-            success := call(gas(), a, 0, 0, 0, 0, 0)
-        }
-
-        require(success, "ETH_TRANSFER_FAILED");
+        // Unclear why _e function call is not detected
+        _e(_d);
     }
+
+    function _e(uint _d) internal {}
 }

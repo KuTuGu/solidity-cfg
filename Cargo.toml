@@ -6,10 +6,10 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+anyhow = "1.0.70"
 ethers = { version = "2.0.0", features = ["solc-full", "solc-tests"] }
 revm = "3.0.0"
 semver = "1.0.17"
-tracing = "0.1.37"
 
 [dev-dependencies]
 tokio = "1.26.0"
