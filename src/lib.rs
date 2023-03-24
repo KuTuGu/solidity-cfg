@@ -16,28 +16,44 @@ use std::{collections::BTreeMap, fs};
 
 abigen!(TestContract, r#"[function entry(uint _a, uint _b)]"#);
 
-#[derive(Debug)]
-pub struct CFG {
-    pub path: String,
-    pub contract: String,
+struct AST {
+    source_code: Bytes,
+    source_map: SourceMap,
+    pc_ic_map: PCICMap,
 }
 
 #[derive(Debug)]
-pub struct Node {
+pub enum Node {
+    Func(FuncNode),
+    Call(CallNode),
+}
+
+#[derive(Debug)]
+pub struct FuncNode {
     pub name: String,
     pub depth: u64,
     pub op: Opcode,
     pub contract: Address,
-    pub caller: Address,
     pub input: Option<BTreeMap<String, Token>>,
     pub output: Option<BTreeMap<String, Token>>,
-    pub gas: Gas,
+    pub gas: u64,
 }
 
 #[derive(Debug)]
-pub struct Gas {
-    pub gas_cost: u64,
-    pub total_gas: u64,
+pub struct CallNode {
+    pub address: Address,
+    pub depth: u64,
+    pub op: Opcode,
+    pub value: Option<U256>,
+    pub input: Option<String>,
+    pub output: Option<String>,
+    pub gas: u64,
+}
+
+#[derive(Debug)]
+pub struct CFG {
+    pub path: String,
+    pub contract: String,
 }
 
 impl CFG {
@@ -58,41 +74,9 @@ impl CFG {
                 .struct_logs
                 .iter()
                 .filter_map(|log| match log.op.parse::<Opcode>().ok()? {
-                    Opcode::JUMP | Opcode::JUMPI => {
-                        ast.iter()
-                            .find_map(|(_source_index, (.., source_map, pc_ic_map))| {
-                                let pc = log.pc as usize;
-                                let ic = *pc_ic_map.get(&pc)?;
-                                let element = source_map.get(ic)?;
-                                match element {
-                                    SourceElement {
-                                        jump,
-                                        index: Some(index),
-                                        ..
-                                    } if (jump == &Jump::In || jump == &Jump::Out)
-                                        && index != &u32::MAX
-                                        && ast.get(&index) != None =>
-                                    {
-                                        let stack = log.stack.clone()?;
-                                        let dest = stack.get(stack.len() - 1)?.as_usize();
-                                        let dest_element =
-                                            source_map.get(*pc_ic_map.get(&dest)?)?;
-                                        let dest_func = self.parse_func(&ast, dest_element);
-                                        let current_func = self.parse_func(&ast, element);
-
-                                        match jump {
-                                            &Jump::In => {
-                                                Some(self.parse_node(dest_func?, jump, log)?)
-                                            }
-                                            &Jump::Out => {
-                                                Some(self.parse_node(current_func?, jump, log)?)
-                                            }
-                                            _ => unreachable!(),
-                                        }
-                                    }
-                                    _ => None,
-                                }
-                            })
+                    Opcode::JUMP | Opcode::JUMPI => self.parse_func_node(log, &ast),
+                    Opcode::CALL | Opcode::STATICCALL | Opcode::DELEGATECALL | Opcode::RETURN => {
+                        self.parse_call_node(log)
                     }
                     _ => None,
                 })
@@ -156,9 +140,9 @@ impl CFG {
         }
     }
 
-    fn ast(&self, project: ProjectCompileOutput) -> BTreeMap<u32, (Bytes, SourceMap, PCICMap)> {
+    fn ast(&self, project: ProjectCompileOutput) -> BTreeMap<u32, AST> {
         let (artifacts, mut sources) = project.into_artifacts_with_sources();
-        let (result, ..): (BTreeMap<u32, (Bytes, SourceMap, PCICMap)>, ()) = artifacts
+        let (result, ..): (BTreeMap<u32, AST>, ()) = artifacts
             .into_iter()
             .map(|(id, artifact)| (id, CompactContractBytecode::from(artifact)))
             .filter_map(|(id, artifact)| {
@@ -171,22 +155,28 @@ impl CFG {
 
                 let source_map = artifact.get_source_map_deployed()?.ok()?;
                 let bytecode = artifact.get_deployed_bytecode_bytes()?;
-                let pc_ic_maps = build_pc_ic_map(SpecId::LATEST, &bytecode);
+                let pc_ic_map = build_pc_ic_map(SpecId::LATEST, &bytecode);
 
-                Some(((source_index, (source_code, source_map, pc_ic_maps)), ()))
+                Some((
+                    (
+                        source_index,
+                        AST {
+                            source_code,
+                            source_map,
+                            pc_ic_map,
+                        },
+                    ),
+                    (),
+                ))
             })
             .unzip();
 
         result
     }
 
-    fn parse_func(
-        &self,
-        ast: &BTreeMap<u32, (Bytes, SourceMap, PCICMap)>,
-        el: &SourceElement,
-    ) -> Option<Function> {
-        let dest_code = &ast.get(&el.index?)?.0;
-        let f = String::from_utf8(dest_code[el.offset..el.offset + el.length].to_vec()).ok()?;
+    fn parse_func(&self, ast: &BTreeMap<u32, AST>, el: &SourceElement) -> Option<Function> {
+        let code = &ast.get(&el.index?)?.source_code;
+        let f = String::from_utf8(code[el.offset..el.offset + el.length].to_vec()).ok()?;
         let f = f.split("{").next()?;
         let abi = AbiParser::default().parse(&[&f]).ok()?;
         let (.., f) = abi.functions.into_iter().next()?;
@@ -194,72 +184,137 @@ impl CFG {
         f.into_iter().next()
     }
 
-    fn parse_node(&self, f: Function, typ: &Jump, log: &StructLog) -> Option<Node> {
-        let Function {
-            name,
-            inputs,
-            outputs,
-            ..
-        } = f;
-        let param = match typ {
-            Jump::In => inputs,
-            Jump::Out => outputs,
-            _ => unreachable!(),
-        };
-        let mut name_offset = 0;
-        let (names, types): (Vec<String>, Vec<ParamType>) = param
-            .into_iter()
-            .rev()
-            .map(|param| {
-                (
-                    if param.name.is_empty() {
-                        name_offset += 1;
-                        name_offset.to_string()
-                    } else {
-                        param.name
-                    },
-                    param.kind,
-                )
-            })
-            .unzip();
+    fn parse_func_node(&self, log: &StructLog, ast: &BTreeMap<u32, AST>) -> Option<Node> {
+        ast.iter().find_map(
+            |(
+                _source_index,
+                AST {
+                    source_map,
+                    pc_ic_map,
+                    ..
+                },
+            )| {
+                let pc = log.pc as usize;
+                let ic = *pc_ic_map.get(&pc)?;
+                let element = source_map.get(ic)?;
+                match element {
+                    SourceElement {
+                        jump,
+                        index: Some(index),
+                        ..
+                    } if (jump == &Jump::In || jump == &Jump::Out) && index != &u32::MAX => {
+                        let mut stack = log.stack.clone()?.into_iter().rev();
+                        let dest = stack.next()?.as_usize();
+                        let dest_element = source_map.get(*pc_ic_map.get(&dest)?)?;
+                        let (name, param) = match jump {
+                            &Jump::In => {
+                                // Enter a function, parse the input abi of the target function
+                                let f = self.parse_func(&ast, dest_element)?;
+                                (f.name, f.inputs)
+                            }
+                            &Jump::Out => {
+                                // Exit a function, parse the output abi of the current function
+                                let f = self.parse_func(&ast, element)?;
+                                (f.name, f.outputs)
+                            }
+                            _ => unreachable!(),
+                        };
 
-        let mut stack = log.stack.clone()?.into_iter().rev();
-        let _dest = stack.next();
-        let tokens = decode(
-            types.as_ref(),
-            stack
-                .into_iter()
-                .flat_map(|i| i.encode())
-                .collect::<Vec<u8>>()
-                .as_ref(),
+                        let mut name_offset = 0;
+                        let (names, types): (Vec<String>, Vec<ParamType>) = param
+                            .into_iter()
+                            .rev()
+                            .map(|param| {
+                                (
+                                    // default variable name for output
+                                    if param.name.is_empty() {
+                                        name_offset += 1;
+                                        name_offset.to_string()
+                                    } else {
+                                        param.name
+                                    },
+                                    param.kind,
+                                )
+                            })
+                            .unzip();
+                        let tokens = decode(
+                            types.as_ref(),
+                            stack
+                                .into_iter()
+                                .flat_map(|i| i.encode())
+                                .collect::<Vec<u8>>()
+                                .as_ref(),
+                        )
+                        .ok()?;
+
+                        let (data, ..): (BTreeMap<String, Token>, ()) = names
+                            .into_iter()
+                            .zip(tokens.into_iter())
+                            .map(|token| (token, ()))
+                            .unzip();
+                        let (input, output) = match data.is_empty() {
+                            true => (None, None),
+                            false if jump == &Jump::In => (Some(data), None),
+                            false if jump == &Jump::Out => (None, Some(data)),
+                            _ => unreachable!(),
+                        };
+
+                        Some(Node::Func(FuncNode {
+                            name,
+                            depth: log.depth,
+                            op: log.op.parse::<Opcode>().ok()?,
+                            contract: Address::zero(),
+                            input,
+                            output,
+                            gas: log.gas,
+                        }))
+                    }
+                    _ => None,
+                }
+            },
         )
-        .ok()?;
+    }
 
-        let (data, ..): (BTreeMap<String, Token>, ()) = names
-            .into_iter()
-            .zip(tokens.into_iter())
-            .map(|token| (token, ()))
-            .unzip();
-        let (input, output) = match data.is_empty() {
-            true => (None, None),
-            false if typ == &Jump::In => (Some(data), None),
-            false if typ == &Jump::Out => (None, Some(data)),
-            _ => unreachable!(),
+    fn parse_call_node(&self, log: &StructLog) -> Option<Node> {
+        let opcode = log.op.parse::<Opcode>().ok()?;
+        let mut stack = log.stack.clone()?.into_iter().rev();
+        let (gas, address, value) = if opcode != Opcode::RETURN {
+            let gas = stack.next()?.as_u64();
+            let address = stack.next()?;
+            let address: Address = (address.leading_zeros() >= 96)
+                .then(|| Address::from_slice(&address.encode()[12..]))?;
+            let value = if opcode == Opcode::CALL {
+                Some(stack.next()?)
+            } else {
+                None
+            };
+
+            (gas, address, value)
+        } else {
+            (0, Address::zero(), None)
+        };
+        let offset = stack.next()?.as_usize();
+        let length = stack.next()?.as_usize();
+        let data = log.memory.clone().and_then(|data| {
+            data.join("")
+                .get(offset..offset + length)
+                .and_then(|data| Some(data.to_string()))
+        });
+        let (input, output) = if opcode != Opcode::RETURN {
+            (data, None)
+        } else {
+            (None, data)
         };
 
-        Some(Node {
-            name,
-            depth: log.depth,
-            op: log.op.parse::<Opcode>().ok()?,
-            contract: Address::zero(),
-            caller: Address::zero(),
+        Some(Node::Call(CallNode {
+            address,
+            value,
             input,
             output,
-            gas: Gas {
-                gas_cost: log.gas_cost,
-                total_gas: log.gas,
-            },
-        })
+            depth: log.depth,
+            op: opcode,
+            gas,
+        }))
     }
 }
 
