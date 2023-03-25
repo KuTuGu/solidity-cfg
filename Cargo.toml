@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.70"
 ethers = { version = "2.0.0", features = ["solc-full", "solc-tests"] }
+petgraph = "0.6.3"
 revm = "3.0.0"
 semver = "1.0.17"
 

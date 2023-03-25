@@ -7,6 +7,9 @@ use ethers::solc::{
     ProjectCompileOutput,
 };
 use ethers::utils::Anvil;
+use petgraph::graph::DiGraph;
+use petgraph::graph::NodeIndex;
+use petgraph::Graph;
 use revm::interpreter::{opcode, spec_opcode_gas};
 use revm::primitives::SpecId;
 use std::fmt::Debug;
@@ -21,36 +24,33 @@ struct AST {
     source_map: SourceMap,
     pc_ic_map: PCICMap,
 }
-
-#[derive(Debug)]
-pub enum Node {
-    Func(FuncNode),
-    Call(CallNode),
-}
-
-#[derive(Debug)]
-pub struct FuncNode {
-    pub name: String,
-    pub depth: u64,
-    pub op: Opcode,
-    pub contract: Address,
-    pub input: Option<BTreeMap<String, Token>>,
-    pub output: Option<BTreeMap<String, Token>>,
-    pub gas: u64,
-}
-
-#[derive(Debug)]
-pub struct CallNode {
-    pub address: Address,
+#[derive(Debug, Clone)]
+pub struct Node {
+    pub typ: NodeType,
+    pub enter: bool,
+    pub name: Option<String>,
+    pub address: Option<Address>,
     pub depth: u64,
     pub op: Opcode,
     pub value: Option<U256>,
     pub input: Option<String>,
     pub output: Option<String>,
-    pub gas: u64,
+    pub gas: Gas,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+pub enum NodeType {
+    Function,
+    Call,
+}
+
+#[derive(Debug, Clone)]
+pub struct Gas {
+    pub gas_used: u64,
+    pub gas_left: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct CFG {
     pub path: String,
     pub contract: String,
@@ -64,25 +64,27 @@ impl CFG {
         }
     }
 
-    pub async fn analyze(&self) -> Result<Vec<Node>> {
+    pub async fn analyze(&self) -> Result<Graph<Node, ()>> {
         let project = self.compile()?;
         let trace = self.get_contract_trace(&project).await?;
         let ast = self.ast(project);
 
-        Ok(match trace {
+        Ok(self.parse_graph(match trace {
             GethTrace::Known(GethTraceFrame::Default(frame)) => frame
                 .struct_logs
                 .iter()
                 .filter_map(|log| match log.op.parse::<Opcode>().ok()? {
                     Opcode::JUMP | Opcode::JUMPI => self.parse_func_node(log, &ast),
-                    Opcode::CALL | Opcode::STATICCALL | Opcode::DELEGATECALL | Opcode::RETURN => {
-                        self.parse_call_node(log)
-                    }
+                    Opcode::CALL
+                    | Opcode::STATICCALL
+                    | Opcode::DELEGATECALL
+                    | Opcode::RETURN
+                    | Opcode::STOP => self.parse_call_node(log),
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
             _ => vec![],
-        })
+        }))
     }
 
     fn compile(&self) -> Result<ProjectCompileOutput> {
@@ -206,16 +208,20 @@ impl CFG {
                         let mut stack = log.stack.clone()?.into_iter().rev();
                         let dest = stack.next()?.as_usize();
                         let dest_element = source_map.get(*pc_ic_map.get(&dest)?)?;
-                        let (name, param) = match jump {
+                        let (enter, name, param) = match jump {
                             &Jump::In => {
                                 // Enter a function, parse the input abi of the target function
-                                let f = self.parse_func(&ast, dest_element)?;
-                                (f.name, f.inputs)
+                                match self.parse_func(&ast, dest_element) {
+                                    Some(f) => (true, f.name, f.inputs),
+                                    None => (true, "unknown".into(), vec![]),
+                                }
                             }
                             &Jump::Out => {
                                 // Exit a function, parse the output abi of the current function
-                                let f = self.parse_func(&ast, element)?;
-                                (f.name, f.outputs)
+                                match self.parse_func(&ast, element) {
+                                    Some(f) => (false, f.name, f.outputs),
+                                    None => (false, "unknown".into(), vec![]),
+                                }
                             }
                             _ => unreachable!(),
                         };
@@ -254,20 +260,26 @@ impl CFG {
                             .unzip();
                         let (input, output) = match data.is_empty() {
                             true => (None, None),
-                            false if jump == &Jump::In => (Some(data), None),
-                            false if jump == &Jump::Out => (None, Some(data)),
+                            false if jump == &Jump::In => (Some(format!("{:#?}", data)), None),
+                            false if jump == &Jump::Out => (None, Some(format!("{:#?}", data))),
                             _ => unreachable!(),
                         };
 
-                        Some(Node::Func(FuncNode {
-                            name,
+                        Some(Node {
+                            typ: NodeType::Function,
+                            enter,
+                            name: Some(name),
+                            address: None,
                             depth: log.depth,
                             op: log.op.parse::<Opcode>().ok()?,
-                            contract: Address::zero(),
+                            value: None,
                             input,
                             output,
-                            gas: log.gas,
-                        }))
+                            gas: Gas {
+                                gas_left: log.gas,
+                                gas_used: 0,
+                            },
+                        })
                     }
                     _ => None,
                 }
@@ -278,43 +290,86 @@ impl CFG {
     fn parse_call_node(&self, log: &StructLog) -> Option<Node> {
         let opcode = log.op.parse::<Opcode>().ok()?;
         let mut stack = log.stack.clone()?.into_iter().rev();
-        let (gas, address, value) = if opcode != Opcode::RETURN {
-            let gas = stack.next()?.as_u64();
-            let address = stack.next()?;
-            let address: Address = (address.leading_zeros() >= 96)
-                .then(|| Address::from_slice(&address.encode()[12..]))?;
-            let value = if opcode == Opcode::CALL {
-                Some(stack.next()?)
-            } else {
-                None
-            };
+        let (enter, gas, address, value) = match opcode {
+            Opcode::CALL | Opcode::DELEGATECALL | Opcode::STATICCALL => {
+                let gas = stack.next()?.as_u64();
+                let address = stack.next()?;
+                let address = Some(
+                    (address.leading_zeros() >= 96)
+                        .then(|| Address::from_slice(&address.encode()[12..]))?,
+                );
+                let value = if opcode == Opcode::CALL {
+                    Some(stack.next()?)
+                } else {
+                    None
+                };
 
-            (gas, address, value)
-        } else {
-            (0, Address::zero(), None)
-        };
-        let offset = stack.next()?.as_usize();
-        let length = stack.next()?.as_usize();
-        let data = log.memory.clone().and_then(|data| {
-            data.join("")
-                .get(offset..offset + length)
-                .and_then(|data| Some(data.to_string()))
-        });
-        let (input, output) = if opcode != Opcode::RETURN {
-            (data, None)
-        } else {
-            (None, data)
+                (true, gas, address, value)
+            }
+            _ => (false, 0, None, None),
         };
 
-        Some(Node::Call(CallNode {
+        let (input, output) = match opcode {
+            Opcode::STOP => (None, None),
+            _ => {
+                let offset = stack.next()?.as_usize();
+                let length = stack.next()?.as_usize();
+                let data = log.memory.clone().and_then(|data| {
+                    data.join("")
+                        .get(offset..offset + length)
+                        .map(|data| data.to_string())
+                });
+
+                if opcode == Opcode::RETURN {
+                    (data, None)
+                } else {
+                    (None, data)
+                }
+            }
+        };
+
+        Some(Node {
+            typ: NodeType::Call,
+            enter,
+            name: None,
             address,
             value,
             input,
             output,
             depth: log.depth,
             op: opcode,
-            gas,
-        }))
+            gas: Gas {
+                gas_left: gas,
+                gas_used: 0,
+            },
+        })
+    }
+
+    // merge node by postfix expression
+    fn parse_graph(&self, list: Vec<Node>) -> Graph<Node, ()> {
+        let mut graph = DiGraph::new();
+        let mut stack: Vec<(Node, NodeIndex)> = vec![];
+        list.into_iter().for_each(|node| {
+            if node.enter {
+                let index = graph.add_node(node.clone());
+                stack
+                    .iter()
+                    .rev()
+                    .next()
+                    .map(|(.., parent_index)| graph.add_edge(parent_index.clone(), index, ()));
+                stack.push((node, index));
+            } else {
+                let exit = node;
+                let (mut enter, enter_index) = stack.pop().unwrap();
+                enter.output = exit.output;
+                enter.gas.gas_left = enter.gas.gas_left.checked_sub(exit.gas.gas_left).unwrap();
+
+                let node = graph.node_weight_mut(enter_index).unwrap();
+                *node = enter;
+            }
+        });
+
+        graph
     }
 }
 
@@ -347,11 +402,15 @@ fn build_pc_ic_map(spec: SpecId, code: &[u8]) -> PCICMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use petgraph::algo::toposort;
 
     #[tokio::test]
     async fn test_it_works() {
         let cfg = CFG::new("contracts", "A");
         let result = cfg.analyze().await.unwrap();
-        dbg!(result);
+        let order = toposort(&result, None).unwrap();
+        order.into_iter().for_each(|index| {
+            dbg!(&result[index]);
+        });
     }
 }
