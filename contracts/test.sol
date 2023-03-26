@@ -40,7 +40,6 @@ interface ID {
 
 contract D is ID {
     function d(uint _d) external {
-        // Unclear why _e function call is not detected
         _e(_d);
     }
 
