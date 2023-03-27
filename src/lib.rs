@@ -21,7 +21,6 @@ use std::{collections::BTreeMap, fs};
 
 #[derive(Debug, Clone)]
 pub struct Node {
-    pub typ: NodeType,
     pub enter: bool,
     pub name: Option<String>,
     pub address: Option<Address>,
@@ -31,12 +30,6 @@ pub struct Node {
     pub input: Option<String>,
     pub output: Option<String>,
     pub gas: Gas,
-}
-
-#[derive(Debug, Clone)]
-pub enum NodeType {
-    Function,
-    Call,
 }
 
 #[derive(Debug, Clone)]
@@ -113,7 +106,7 @@ impl CFG {
             _ => vec![],
         };
 
-        Ok(self.parse_graph(node_list))
+        self.parse_graph(node_list)
     }
 
     fn parse_func(&self, log: &StructLog) -> Option<Node> {
@@ -146,12 +139,17 @@ impl CFG {
                     element
                 };
                 let f = source_code.get(el.offset..el.offset + el.length)?;
-                let f = f.split("{").next()?;
-                let abi = AbiParser::default().parse(&[&f]).ok()?;
-                let (.., f) = abi.functions.into_iter().next()?;
-                let f = f.into_iter().next()?;
-                let param = if enter { f.inputs } else { f.outputs };
+                let mut f = f.split("{").next()?.to_owned();
+                // need to deal with irregular abi case where modifier exists and no returns
+                if !f.contains(" returns ") {
+                    f += " returns ()";
+                }
 
+                let (name, param) = match AbiParser::default().parse_function(&f) {
+                    Ok(f) if enter => (f.name, f.inputs),
+                    Ok(f) if !enter => (f.name, f.outputs),
+                    _ => ("unknown".to_string(), vec![]),
+                };
                 let mut name_offset = 0;
                 let (names, types): (Vec<String>, Vec<ParamType>) = param
                     .into_iter()
@@ -169,6 +167,7 @@ impl CFG {
                         )
                     })
                     .unzip();
+
                 let tokens = decode(
                     types.as_ref(),
                     stack
@@ -192,9 +191,8 @@ impl CFG {
                 };
 
                 Some(Node {
-                    typ: NodeType::Function,
                     enter,
-                    name: Some(f.name),
+                    name: Some(name),
                     address: Some(contract.clone()),
                     depth: log.depth,
                     op: log.op.parse::<Opcode>().ok()?,
@@ -260,7 +258,6 @@ impl CFG {
         };
 
         Some(Node {
-            typ: NodeType::Call,
             enter,
             name: None,
             address,
@@ -277,32 +274,40 @@ impl CFG {
     }
 
     // merge node by postfix expression
-    fn parse_graph(&self, list: Vec<Node>) -> Graph<Node, ()> {
+    fn parse_graph(&self, list: Vec<Node>) -> Result<Graph<Node, ()>> {
         let mut graph = DiGraph::new();
         let mut stack: Vec<(Node, NodeIndex)> = vec![];
-        list.into_iter().for_each(|node| {
-            if node.enter {
-                let index = graph.add_node(node.clone());
-                stack
-                    .iter()
-                    .rev()
-                    .next()
-                    .map(|(.., parent_index)| graph.add_edge(parent_index.clone(), index, ()));
-                stack.push((node, index));
-            } else {
-                let exit = node;
-                let (mut enter, enter_index) = stack.pop().unwrap();
+        let len = list.len() - 1;
+        list.into_iter().enumerate().for_each(|(i, node)| {
+            // The last end opcode has no corresponding start node
+            if i < len {
+                if node.enter {
+                    let index = graph.add_node(node.clone());
+                    stack
+                        .iter()
+                        .rev()
+                        .next()
+                        .map(|(.., parent_index)| graph.add_edge(parent_index.clone(), index, ()));
+                    stack.push((node, index));
+                } else {
+                    let exit = node;
+                    let (mut enter, enter_index) = stack.pop().unwrap();
 
-                // merge enter && exit node
-                enter.output = exit.output;
-                enter.gas.gas_left = enter.gas.gas_left.checked_sub(exit.gas.gas_left).unwrap();
+                    // merge enter && exit node
+                    enter.output = exit.output;
+                    enter.gas.gas_left = enter.gas.gas_left.checked_sub(exit.gas.gas_left).unwrap();
 
-                let node = graph.node_weight_mut(enter_index).unwrap();
-                *node = enter;
+                    let node = graph.node_weight_mut(enter_index).unwrap();
+                    *node = enter;
+                }
             }
         });
 
-        graph
+        if stack.is_empty() {
+            Ok(graph)
+        } else {
+            Err(anyhow!("Failed to parse cfg"))
+        }
     }
 }
 
@@ -344,7 +349,7 @@ impl LocalContractIdentifier {
     }
 
     pub fn verify(&mut self, project: ProjectCompileOutput) {
-        let (artifacts, mut sources) = project.into_artifacts_with_sources();
+        let (artifacts, sources) = project.into_artifacts_with_sources();
 
         self.source_code = sources
             .into_sources()
