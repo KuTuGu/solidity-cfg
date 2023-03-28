@@ -1,5 +1,5 @@
-use anyhow::{anyhow, Result};
-use ethers::abi::{decode, AbiEncode, AbiParser, ParamType};
+use anyhow::{anyhow, Error, Result};
+use ethers::abi::{decode, AbiEncode, AbiParser, ParamType, Token};
 use ethers::prelude::k256::ecdsa::SigningKey;
 use ethers::prelude::*;
 use ethers::solc::sourcemap::{Jump, SourceElement};
@@ -8,6 +8,7 @@ use ethers::solc::{
     ProjectCompileOutput,
 };
 use ethers::types::transaction::eip2718::TypedTransaction;
+use ethers::utils::hex::FromHex;
 use petgraph::graph::DiGraph;
 use petgraph::graph::NodeIndex;
 use petgraph::Graph;
@@ -27,8 +28,8 @@ pub struct Node {
     pub depth: u64,
     pub op: Opcode,
     pub value: Option<U256>,
-    pub input: Option<String>,
-    pub output: Option<String>,
+    pub input: Option<BTreeMap<String, Token>>,
+    pub output: Option<BTreeMap<String, Token>>,
     pub gas: Gas,
 }
 
@@ -38,6 +39,12 @@ pub struct Gas {
     pub gas_left: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct CallStack {
+    address: Address,
+    data: Option<String>,
+}
+
 pub type Client = Arc<SignerMiddleware<Provider<Http>, Wallet<SigningKey>>>;
 
 pub struct CFG {
@@ -45,7 +52,7 @@ pub struct CFG {
     client: Client,
     identifier: LocalContractIdentifier,
     bytecode: HashMap<Address, Bytes>,
-    call_stack: Vec<Address>,
+    call_stack: Vec<CallStack>,
 }
 
 impl CFG {
@@ -55,7 +62,10 @@ impl CFG {
         identifier: LocalContractIdentifier,
     ) -> Result<Self> {
         let contract = tx.to_addr().unwrap().clone();
-        let call_stack = vec![contract];
+        let call_stack = vec![CallStack {
+            address: contract,
+            data: tx.data().map(|d| d.to_string()),
+        }];
         let mut bytecode = HashMap::<Address, Bytes>::new();
         bytecode.insert(contract, client.get_code(contract, None).await?);
 
@@ -72,7 +82,7 @@ impl CFG {
         let options: GethDebugTracingCallOptions = GethDebugTracingCallOptions {
             tracing_options: GethDebugTracingOptions {
                 disable_storage: Some(true),
-                enable_memory: Some(false),
+                enable_memory: Some(true),
                 ..Default::default()
             },
         };
@@ -87,7 +97,7 @@ impl CFG {
                 for log in &frame.struct_logs {
                     if let Some(node) = async {
                         match log.op.parse::<Opcode>().ok()? {
-                            Opcode::JUMP | Opcode::JUMPI => self.parse_func(log),
+                            Opcode::JUMP | Opcode::JUMPI => self.parse_fn(log),
                             Opcode::CALL
                             | Opcode::STATICCALL
                             | Opcode::DELEGATECALL
@@ -109,9 +119,9 @@ impl CFG {
         self.parse_graph(node_list)
     }
 
-    fn parse_func(&self, log: &StructLog) -> Option<Node> {
+    fn parse_fn(&self, log: &StructLog) -> Option<Node> {
         // if no source, the contract is not verified, just return
-        let contract = self.call_stack.iter().rev().next()?;
+        let contract = &self.call_stack.last()?.address;
         let (source_map, pc_ic_map) = self
             .identifier
             .source_map
@@ -128,8 +138,7 @@ impl CFG {
             } if jump == &Jump::In || jump == &Jump::Out => {
                 let enter = jump == &Jump::In;
                 let source_code = self.identifier.source_code.get(index)?;
-                let mut stack = log.stack.clone()?.into_iter().rev();
-                let dest = stack.next()?.as_usize();
+                let dest = log.stack.as_ref()?.last()?.as_usize();
 
                 // Enter a function, parse the input abi of the target function
                 // Exit a function, parse the output abi of the current function
@@ -138,57 +147,20 @@ impl CFG {
                 } else {
                     element
                 };
+
                 let f = source_code.get(el.offset..el.offset + el.length)?;
-                let mut f = f.split("{").next()?.to_owned();
-                // need to deal with irregular abi case where modifier exists and no returns
-                if !f.contains(" returns ") {
-                    f += " returns ()";
-                }
+                let (name, input, output) = self.parse_fn_data(f, log, enter).map_or_else(
+                    || ("unknown".to_string(), None, None),
+                    |(name, data)| {
+                        let data = data.filter(|d| !d.is_empty());
 
-                let (name, param) = match AbiParser::default().parse_function(&f) {
-                    Ok(f) if enter => (f.name, f.inputs),
-                    Ok(f) if !enter => (f.name, f.outputs),
-                    _ => ("unknown".to_string(), vec![]),
-                };
-                let mut name_offset = 0;
-                let (names, types): (Vec<String>, Vec<ParamType>) = param
-                    .into_iter()
-                    .rev()
-                    .map(|param| {
-                        (
-                            // default variable name for output
-                            if param.name.is_empty() {
-                                name_offset += 1;
-                                name_offset.to_string()
-                            } else {
-                                param.name
-                            },
-                            param.kind,
-                        )
-                    })
-                    .unzip();
-
-                let tokens = decode(
-                    types.as_ref(),
-                    stack
-                        .into_iter()
-                        .flat_map(|i| i.encode())
-                        .collect::<Vec<u8>>()
-                        .as_ref(),
-                )
-                .ok()?;
-
-                let data = names
-                    .into_iter()
-                    .zip(tokens.into_iter())
-                    .map(|token| token)
-                    .collect::<BTreeMap<_, _>>();
-                let (input, output) = match data.is_empty() {
-                    true => (None, None),
-                    false if jump == &Jump::In => (Some(format!("{:#?}", data)), None),
-                    false if jump == &Jump::Out => (None, Some(format!("{:#?}", data))),
-                    _ => unreachable!(),
-                };
+                        if jump == &Jump::In {
+                            (name, data, None)
+                        } else {
+                            (name, None, data)
+                        }
+                    },
+                );
 
                 Some(Node {
                     enter,
@@ -209,9 +181,98 @@ impl CFG {
         }
     }
 
+    fn parse_fn_data(
+        &self,
+        f: &str,
+        log: &StructLog,
+        input: bool,
+    ) -> Option<(String, Option<BTreeMap<String, Token>>)> {
+        let (f, _body) = f.split_once("{")?.to_owned();
+        let mut f = f.to_string();
+        // need to deal with irregular abi case where modifier exists and no returns
+        if !f.contains(" returns ") {
+            f += " returns ()";
+        }
+        let param_str = if input {
+            let (_s, param_str) = f.split_once('(')?;
+            let (param_str, _s) = param_str.split_once(')')?;
+            param_str
+        } else {
+            let (_s, param_str) = f.rsplit_once('(')?;
+            let (param_str, _s) = param_str.rsplit_once(')')?;
+            param_str
+        };
+
+        let mut stack = log.stack.as_ref()?.iter().rev();
+        let _dest = stack.next()?;
+        let mut parse_err = false;
+        let data = param_str
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .filter_map(|param| {
+                let data = {
+                    let data = stack.next()?;
+                    if param.contains("memory") || param.contains("calldata") {
+                        let str = if param.contains("memory") {
+                            log.memory.as_ref()?.join("")
+                        } else {
+                            self.call_stack.last()?.data.clone()?
+                        };
+
+                        let pointer = ((data.as_usize() + 32) as u64).encode_hex()[2..].to_owned();
+                        Vec::from_hex(pointer + &str).ok()
+                    } else {
+                        Some(data.encode())
+                    }
+                };
+
+                data.map_or_else(
+                    || {
+                        parse_err = true;
+                        None
+                    },
+                    |data| Some(data),
+                )
+            })
+            .flatten()
+            .collect::<Vec<u8>>();
+
+        let f = AbiParser::default().parse_function(&f).ok()?;
+        let name = f.name;
+        if parse_err {
+            return Some((name, None));
+        }
+        let param = if input { f.inputs } else { f.outputs };
+        let mut name_offset = 0;
+        let (names, types): (Vec<String>, Vec<ParamType>) = param
+            .into_iter()
+            .rev()
+            .map(|param| {
+                (
+                    // default variable name for output
+                    if param.name.is_empty() {
+                        name_offset += 1;
+                        name_offset.to_string()
+                    } else {
+                        param.name
+                    },
+                    param.kind,
+                )
+            })
+            .unzip();
+        let tokens = decode(types.as_ref(), &data).ok()?;
+        let data = names
+            .into_iter()
+            .zip(tokens.into_iter())
+            .map(|token| token)
+            .collect::<BTreeMap<_, _>>();
+
+        Some((name, Some(data)))
+    }
+
     async fn parse_call(&mut self, log: &StructLog) -> Option<Node> {
         let opcode = log.op.parse::<Opcode>().ok()?;
-        let mut stack = log.stack.clone()?.into_iter().rev();
+        let mut stack = log.stack.as_ref()?.into_iter().rev();
         let (enter, gas, address, value) = match opcode {
             Opcode::CALL | Opcode::DELEGATECALL | Opcode::STATICCALL => {
                 let gas = stack.next()?.as_u64();
@@ -219,12 +280,11 @@ impl CFG {
                 let address = (address.leading_zeros() >= 96)
                     .then(|| Address::from_slice(&address.encode()[12..]))?;
                 let value = if opcode == Opcode::CALL {
-                    Some(stack.next()?)
+                    Some(stack.next()?.clone())
                 } else {
                     None
                 };
 
-                self.call_stack.push(address);
                 // store contract bytecode
                 self.bytecode
                     .entry(address)
@@ -241,18 +301,29 @@ impl CFG {
         let (input, output) = match opcode {
             Opcode::STOP => (None, None),
             _ => {
-                let offset = stack.next()?.as_usize();
-                let length = stack.next()?.as_usize();
-                let data = log.memory.clone().and_then(|data| {
-                    data.join("")
-                        .get(offset..offset + length)
-                        .map(|data| data.to_string())
+                let offset = stack.next()?.as_usize() * 2;
+                let length = stack.next()?.as_usize() * 2;
+                let data = log
+                    .memory
+                    .as_ref()?
+                    .join("")
+                    .get(offset..offset + length)
+                    .map(|data| data.to_string());
+
+                let token = data.clone().map(|data| {
+                    vec![("calldata".into(), Token::String(data))]
+                        .into_iter()
+                        .collect::<BTreeMap<String, Token>>()
                 });
 
                 if opcode == Opcode::RETURN {
-                    (data, None)
+                    (None, token)
                 } else {
-                    (None, data)
+                    self.call_stack.push(CallStack {
+                        address: address.unwrap(),
+                        data,
+                    });
+                    (token, None)
                 }
             }
         };
@@ -274,39 +345,43 @@ impl CFG {
     }
 
     // merge node by postfix expression
-    fn parse_graph(&self, list: Vec<Node>) -> Result<Graph<Node, ()>> {
+    fn parse_graph(&self, mut list: Vec<Node>) -> Result<Graph<Node, ()>> {
         let mut graph = DiGraph::new();
         let mut stack: Vec<(Node, NodeIndex)> = vec![];
-        let len = list.len() - 1;
-        list.into_iter().enumerate().for_each(|(i, node)| {
-            // The last end opcode has no corresponding start node
-            if i < len {
-                if node.enter {
-                    let index = graph.add_node(node.clone());
-                    stack
-                        .iter()
-                        .rev()
-                        .next()
-                        .map(|(.., parent_index)| graph.add_edge(parent_index.clone(), index, ()));
-                    stack.push((node, index));
-                } else {
-                    let exit = node;
-                    let (mut enter, enter_index) = stack.pop().unwrap();
+        // The last end opcode has no corresponding start node
+        list.pop();
+        list.into_iter().try_for_each(|node| {
+            if node.enter {
+                let index = graph.add_node(node.clone());
+                stack
+                    .last()
+                    .map(|(.., parent_index)| graph.add_edge(parent_index.clone(), index, ()));
+                stack.push((node, index));
+            } else {
+                let exit = node;
+                let (mut enter, enter_index) = stack.pop().ok_or(anyhow!("nodes do not match"))?;
 
-                    // merge enter && exit node
-                    enter.output = exit.output;
-                    enter.gas.gas_left = enter.gas.gas_left.checked_sub(exit.gas.gas_left).unwrap();
+                // merge enter && exit node
+                enter.output = exit.output;
+                enter.gas.gas_left = enter
+                    .gas
+                    .gas_left
+                    .checked_sub(exit.gas.gas_left)
+                    .ok_or(anyhow!("gas calculation error"))?;
 
-                    let node = graph.node_weight_mut(enter_index).unwrap();
-                    *node = enter;
-                }
+                let node = graph
+                    .node_weight_mut(enter_index)
+                    .ok_or(anyhow!("could not found the start node"))?;
+                *node = enter;
             }
-        });
+
+            Ok::<(), Error>(())
+        })?;
 
         if stack.is_empty() {
             Ok(graph)
         } else {
-            Err(anyhow!("Failed to parse cfg"))
+            Err(anyhow!("missing end node"))
         }
     }
 }
