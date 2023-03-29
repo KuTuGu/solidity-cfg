@@ -15,3 +15,4 @@ docs/
 
 /target
 /Cargo.lock
+*.dot

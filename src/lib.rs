@@ -273,9 +273,9 @@ impl CFG {
     async fn parse_call(&mut self, log: &StructLog) -> Option<Node> {
         let opcode = log.op.parse::<Opcode>().ok()?;
         let mut stack = log.stack.as_ref()?.into_iter().rev();
-        let (enter, gas, address, value) = match opcode {
+        let (enter, address, value) = match opcode {
             Opcode::CALL | Opcode::DELEGATECALL | Opcode::STATICCALL => {
-                let gas = stack.next()?.as_u64();
+                let _gas = stack.next()?.as_u64();
                 let address = stack.next()?;
                 let address = (address.leading_zeros() >= 96)
                     .then(|| Address::from_slice(&address.encode()[12..]))?;
@@ -290,11 +290,11 @@ impl CFG {
                     .entry(address)
                     .or_insert(self.client.get_code(address, None).await.ok()?);
 
-                (true, gas, Some(address), value)
+                (true, Some(address), value)
             }
             _ => {
                 self.call_stack.pop();
-                (false, 0, None, None)
+                (false, None, None)
             }
         };
 
@@ -338,8 +338,8 @@ impl CFG {
             depth: log.depth,
             op: opcode,
             gas: Gas {
-                gas_left: gas,
-                gas_used: 0,
+                gas_left: log.gas - log.gas_cost,
+                gas_used: log.gas_cost,
             },
         })
     }
@@ -363,15 +363,17 @@ impl CFG {
 
                 // merge enter && exit node
                 enter.output = exit.output;
-                enter.gas.gas_left = enter
-                    .gas
-                    .gas_left
-                    .checked_sub(exit.gas.gas_left)
-                    .ok_or(anyhow!("gas calculation error"))?;
+                if enter.gas.gas_used == 0 {
+                    enter.gas.gas_used = enter
+                        .gas
+                        .gas_left
+                        .checked_sub(exit.gas.gas_left)
+                        .ok_or(anyhow!("gas calculation error"))?;
+                }
 
                 let node = graph
                     .node_weight_mut(enter_index)
-                    .ok_or(anyhow!("could not found the start node"))?;
+                    .ok_or(anyhow!("could not found the enter node"))?;
                 *node = enter;
             }
 
@@ -477,7 +479,8 @@ fn build_pc_ic_map(spec: SpecId, code: &[u8]) -> PCICMap {
 mod tests {
     use super::*;
     use ethers::utils::Anvil;
-    use petgraph::algo::toposort;
+    use petgraph::dot::Dot;
+    use std::{fs::File, io::Write};
 
     abigen!(TestContract, r#"[function entry(uint _a, uint _b)]"#);
 
@@ -508,9 +511,8 @@ mod tests {
 
         let mut cfg = CFG::new(tx, client, identifier).await.unwrap();
         let graph = cfg.analyze().await.unwrap();
-        let order = toposort(&graph, None).unwrap();
-        order.into_iter().for_each(|index| {
-            dbg!(&graph[index]);
-        });
+        let dot = format!("{:#?}", Dot::new(&graph));
+        let mut file = File::create("graph.dot").unwrap();
+        file.write_all(dot.as_bytes()).unwrap();
     }
 }
