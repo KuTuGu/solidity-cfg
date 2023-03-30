@@ -1,24 +1,19 @@
+mod identifier;
+pub use identifier::*;
+
 use anyhow::{anyhow, Error, Result};
 use ethers::abi::{decode, AbiEncode, AbiParser, ParamType, Token};
 use ethers::prelude::k256::ecdsa::SigningKey;
 use ethers::prelude::*;
 use ethers::solc::sourcemap::{Jump, SourceElement};
-use ethers::solc::{
-    artifacts::contract::CompactContractBytecode, sourcemap::SourceMap, Artifact,
-    ProjectCompileOutput,
-};
 use ethers::types::transaction::eip2718::TypedTransaction;
 use ethers::utils::hex::FromHex;
 use petgraph::graph::DiGraph;
 use petgraph::graph::NodeIndex;
 use petgraph::Graph;
-use revm::interpreter::{opcode, spec_opcode_gas};
-use revm::primitives::SpecId;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fmt::Debug;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::{collections::BTreeMap, fs};
 
 #[derive(Debug, Clone)]
 pub struct Node {
@@ -45,37 +40,25 @@ pub struct CallStack {
     data: Option<String>,
 }
 
-pub type Client = Arc<SignerMiddleware<Provider<Http>, Wallet<SigningKey>>>;
+pub type SignerClient = Arc<SignerMiddleware<Provider<Http>, Wallet<SigningKey>>>;
 
-pub struct CFG {
-    tx: TypedTransaction,
-    client: Client,
-    identifier: LocalContractIdentifier,
-    bytecode: HashMap<Address, Bytes>,
+pub struct CFG<T: Into<TypedTransaction> + Clone, I: ContractIdentifier> {
+    tx: T,
+    block: Option<BlockId>,
+    client: SignerClient,
+    identifier: I,
     call_stack: Vec<CallStack>,
 }
 
-impl CFG {
-    pub async fn new(
-        tx: TypedTransaction,
-        client: Client,
-        identifier: LocalContractIdentifier,
-    ) -> Result<Self> {
-        let contract = tx.to_addr().unwrap().clone();
-        let call_stack = vec![CallStack {
-            address: contract,
-            data: tx.data().map(|d| d.to_string()),
-        }];
-        let mut bytecode = HashMap::<Address, Bytes>::new();
-        bytecode.insert(contract, client.get_code(contract, None).await?);
-
-        Ok(Self {
+impl<T: Into<TypedTransaction> + Clone, I: ContractIdentifier> CFG<T, I> {
+    pub fn new(tx: T, block: Option<BlockId>, client: SignerClient, identifier: I) -> Self {
+        Self {
             tx,
+            block,
             client,
             identifier,
-            bytecode,
-            call_stack,
-        })
+            call_stack: vec![],
+        }
     }
 
     pub async fn analyze(&mut self) -> Result<Graph<Node, ()>> {
@@ -86,15 +69,58 @@ impl CFG {
                 ..Default::default()
             },
         };
+        let tx = self.tx.clone().into();
         let trace = Some(
             self.client
-                .debug_trace_call(self.tx.clone(), None, options)
+                .debug_trace_call(tx.clone(), self.block, options)
                 .await?,
         );
         let node_list = match trace {
             Some(GethTrace::Known(GethTraceFrame::Default(frame))) => {
+                // add first call node
+                let gas = frame.gas.as_u64();
+                let addr =
+                    U256::from_big_endian(tx.to_addr().copied().unwrap_or_default().as_ref());
+                let struct_log = [
+                    vec![StructLog {
+                        depth: 0,
+                        error: None,
+                        gas,
+                        gas_cost: gas,
+                        memory: Some(vec![]),
+                        op: String::from("CALL"),
+                        pc: 0,
+                        refund_counter: None,
+                        stack: Some(vec![
+                            U256::zero(),                            // length
+                            U256::zero(),                            // offset
+                            tx.value().copied().unwrap_or_default(), // value
+                            addr,                                    // address
+                            frame.gas,                               // gas
+                        ]),
+                        storage: None,
+                    }],
+                    frame.struct_logs,
+                ]
+                .concat();
+
+                let call_list = struct_log
+                    .iter()
+                    .filter_map(|log| {
+                        let stack = log.stack.as_ref()?;
+                        match log.op.parse::<Opcode>().ok()? {
+                            Opcode::CALL | Opcode::STATICCALL | Opcode::DELEGATECALL => {
+                                Some(self.parse_call_addr(stack.get(stack.len() - 2)?)?)
+                            }
+                            _ => None,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+
+                self.identifier.build(call_list).await?;
+
                 let mut result = vec![];
-                for log in &frame.struct_logs {
+                for log in &struct_log {
                     if let Some(node) = async {
                         match log.op.parse::<Opcode>().ok()? {
                             Opcode::JUMP | Opcode::JUMPI => self.parse_fn(log),
@@ -102,7 +128,7 @@ impl CFG {
                             | Opcode::STATICCALL
                             | Opcode::DELEGATECALL
                             | Opcode::RETURN
-                            | Opcode::STOP => self.parse_call(log).await,
+                            | Opcode::STOP => self.parse_call(log),
                             _ => None,
                         }
                     }
@@ -121,11 +147,10 @@ impl CFG {
 
     fn parse_fn(&self, log: &StructLog) -> Option<Node> {
         // if no source, the contract is not verified, just return
-        let contract = &self.call_stack.last()?.address;
-        let (source_map, pc_ic_map) = self
-            .identifier
-            .source_map
-            .get(self.bytecode.get(contract)?)?;
+        let contract = self.call_stack.last()?.address;
+        let contract_key = self.identifier.get_contract_key(contract)?;
+        let source_map = self.identifier.get_source_map(&contract_key)?;
+        let pc_ic_map = self.identifier.get_pc_ic_map(&contract_key)?;
         let pc = log.pc as usize;
         let ic = *pc_ic_map.get(&pc)?;
         let element = source_map.get(ic)?;
@@ -137,7 +162,7 @@ impl CFG {
                 ..
             } if jump == &Jump::In || jump == &Jump::Out => {
                 let enter = jump == &Jump::In;
-                let source_code = self.identifier.source_code.get(index)?;
+                let source_code = self.identifier.get_source_code(&contract_key, index)?;
                 let dest = log.stack.as_ref()?.last()?.as_usize();
 
                 // Enter a function, parse the input abi of the target function
@@ -270,33 +295,27 @@ impl CFG {
         Some((name, Some(data)))
     }
 
-    async fn parse_call(&mut self, log: &StructLog) -> Option<Node> {
+    fn parse_call(&mut self, log: &StructLog) -> Option<Node> {
         let opcode = log.op.parse::<Opcode>().ok()?;
         let mut stack = log.stack.as_ref()?.into_iter().rev();
         let (enter, address, value) = match opcode {
             Opcode::CALL | Opcode::DELEGATECALL | Opcode::STATICCALL => {
                 let _gas = stack.next()?.as_u64();
-                let address = stack.next()?;
-                let address = (address.leading_zeros() >= 96)
-                    .then(|| Address::from_slice(&address.encode()[12..]))?;
+                let address = self.parse_call_addr(stack.next()?)?;
                 let value = if opcode == Opcode::CALL {
                     Some(stack.next()?.clone())
                 } else {
                     None
                 };
 
-                // store contract bytecode
-                self.bytecode
-                    .entry(address)
-                    .or_insert(self.client.get_code(address, None).await.ok()?);
-
                 (true, Some(address), value)
             }
             _ => {
-                self.call_stack.pop();
+                self.call_stack.pop()?;
                 (false, None, None)
             }
         };
+        let name = address.and_then(|addr| self.identifier.get_label(addr));
 
         let (input, output) = match opcode {
             Opcode::STOP => (None, None),
@@ -310,12 +329,7 @@ impl CFG {
                     .get(offset..offset + length)
                     .map(|data| data.to_string());
 
-                let token = data.clone().map(|data| {
-                    vec![("calldata".into(), Token::String(data))]
-                        .into_iter()
-                        .collect::<BTreeMap<String, Token>>()
-                });
-
+                let token = self.parse_call_data(data.clone());
                 if opcode == Opcode::RETURN {
                     (None, token)
                 } else {
@@ -330,7 +344,7 @@ impl CFG {
 
         Some(Node {
             enter,
-            name: None,
+            name,
             address,
             value,
             input,
@@ -344,12 +358,22 @@ impl CFG {
         })
     }
 
+    fn parse_call_addr(&self, data: &U256) -> Option<Address> {
+        (data.leading_zeros() >= 96).then(|| Address::from_slice(&data.encode()[12..]))
+    }
+
+    fn parse_call_data(&self, data: Option<String>) -> Option<BTreeMap<String, Token>> {
+        data.filter(|data| !data.is_empty()).map(|data| {
+            vec![("data".into(), Token::String(data))]
+                .into_iter()
+                .collect::<BTreeMap<_, _>>()
+        })
+    }
+
     // merge node by postfix expression
-    fn parse_graph(&self, mut list: Vec<Node>) -> Result<Graph<Node, ()>> {
+    fn parse_graph(&self, list: Vec<Node>) -> Result<Graph<Node, ()>> {
         let mut graph = DiGraph::new();
         let mut stack: Vec<(Node, NodeIndex)> = vec![];
-        // The last end opcode has no corresponding start node
-        list.pop();
         list.into_iter().try_for_each(|node| {
             if node.enter {
                 let index = graph.add_node(node.clone());
@@ -388,93 +412,6 @@ impl CFG {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct LocalContractIdentifier {
-    root: PathBuf,
-    // The unit is file
-    // source_index -> source_code
-    source_code: BTreeMap<u32, String>,
-    // The unit is contract (
-    //   may be larger than files, such as import other files;
-    //   may also be smaller than a file, such as a file with multiple contracts
-    // )
-    // bytecode -> (source_map, pc_ic_map)
-    source_map: HashMap<Bytes, (SourceMap, PCICMap)>,
-}
-
-impl LocalContractIdentifier {
-    pub fn new<T: AsRef<Path>>(path: T) -> Self {
-        Self {
-            root: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path),
-            ..Default::default()
-        }
-    }
-    pub fn compile(&self) -> Result<ProjectCompileOutput> {
-        let paths = ProjectPathsConfig::builder().sources(&self.root).build()?;
-        let project = Project::builder()
-            .paths(paths)
-            .set_cached(false)
-            .set_no_artifacts(false)
-            .build()?
-            .compile()?;
-
-        if project.has_compiler_errors() {
-            Err(anyhow!("{:#?}", project.output().errors))
-        } else {
-            Ok(project)
-        }
-    }
-
-    pub fn verify(&mut self, project: ProjectCompileOutput) {
-        let (artifacts, sources) = project.into_artifacts_with_sources();
-
-        self.source_code = sources
-            .into_sources()
-            .map(|(path, source)| {
-                let file = self.root.join(&path);
-                (source.id, fs::read_to_string(&file).unwrap())
-            })
-            .collect::<BTreeMap<_, _>>();
-
-        self.source_map = artifacts
-            .into_iter()
-            .filter_map(|(_id, artifact)| {
-                let artifact = CompactContractBytecode::from(artifact);
-                let source_map = artifact.get_source_map_deployed()?.ok()?;
-                let bytecode = artifact.get_deployed_bytecode_bytes()?.into_owned();
-                let pc_ic_map = build_pc_ic_map(SpecId::LATEST, &bytecode);
-
-                Some((bytecode, (source_map, pc_ic_map)))
-            })
-            .collect::<HashMap<_, _>>();
-    }
-}
-
-/// A map of program counters to instruction counters.
-type PCICMap = BTreeMap<usize, usize>;
-/// Builds a mapping from instruction counters to program counters.
-fn build_pc_ic_map(spec: SpecId, code: &[u8]) -> PCICMap {
-    let opcode_infos = spec_opcode_gas(spec);
-    let mut pc_ic_map: PCICMap = PCICMap::new();
-
-    let mut i = 0;
-    let mut cumulative_push_size = 0;
-    while i < code.len() {
-        let op = code[i];
-        pc_ic_map.insert(i, i - cumulative_push_size);
-        if opcode_infos[op as usize].is_push() {
-            // Skip the push bytes.
-            //
-            // For more context on the math, see: https://github.com/bluealloy/revm/blob/007b8807b5ad7705d3cacce4d92b89d880a83301/crates/revm/src/interpreter/contract.rs#L114-L115
-            i += (op - opcode::PUSH1 + 1) as usize;
-            cumulative_push_size += (op - opcode::PUSH1 + 1) as usize;
-        }
-        i += 1;
-    }
-
-    pc_ic_map
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,30 +423,30 @@ mod tests {
 
     #[tokio::test]
     async fn test_it_works() {
-        let mut identifier = LocalContractIdentifier::new("contracts");
-        let project = identifier.compile().unwrap();
-
-        // deploy contract && anvil persistence
-        let output = project
-            .find_first("A")
-            .expect("could not find contract")
-            .clone();
-        let (abi, bytecode, _) = output.into_parts();
         let anvil = Anvil::new().port(8545_u16).timeout(20000_000_u64).spawn();
         let wallet: LocalWallet = anvil.keys()[0].clone().into();
         let wallet = wallet.with_chain_id(anvil.chain_id());
         let provider = Provider::<Http>::connect(&anvil.endpoint()).await;
         let client = SignerMiddleware::new(provider, wallet.clone());
         let client = Arc::new(client);
+
+        let identifier = LocalContractIdentifier::new("contracts", client.clone()).unwrap();
+        let output = identifier
+            .project
+            .as_ref()
+            .unwrap()
+            .find_first("A")
+            .expect("could not find contract")
+            .clone();
+        let (abi, bytecode, _) = output.into_parts();
         let factory = ContractFactory::new(abi.unwrap(), bytecode.unwrap(), client.clone());
         let contract = factory.deploy(()).unwrap().send().await.unwrap();
         let addr = contract.address();
 
-        identifier.verify(project);
         let contract = TestContract::new(addr, client.clone());
         let tx = contract.entry(U256::from(1), U256::from(2)).tx;
 
-        let mut cfg = CFG::new(tx, client, identifier).await.unwrap();
+        let mut cfg = CFG::new(tx, None, client, identifier);
         let graph = cfg.analyze().await.unwrap();
         let dot = format!("{:#?}", Dot::new(&graph));
         let mut file = File::create("graph.dot").unwrap();
