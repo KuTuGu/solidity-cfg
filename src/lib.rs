@@ -64,7 +64,7 @@ impl<T: Into<TypedTransaction> + Clone, I: ContractIdentifier> CFG<T, I> {
     pub async fn analyze(&mut self) -> Result<Graph<Node, ()>> {
         let options: GethDebugTracingCallOptions = GethDebugTracingCallOptions {
             tracing_options: GethDebugTracingOptions {
-                disable_storage: Some(true),
+                disable_storage: Some(false),
                 enable_memory: Some(true),
                 ..Default::default()
             },
@@ -123,12 +123,14 @@ impl<T: Into<TypedTransaction> + Clone, I: ContractIdentifier> CFG<T, I> {
                 for log in &struct_log {
                     if let Some(node) = async {
                         match log.op.parse::<Opcode>().ok()? {
-                            Opcode::JUMP | Opcode::JUMPI => self.parse_fn(log),
+                            // log only have jump, no jumpi
+                            Opcode::JUMP => self.parse_fn(log),
                             Opcode::CALL
                             | Opcode::STATICCALL
                             | Opcode::DELEGATECALL
                             | Opcode::RETURN
-                            | Opcode::STOP => self.parse_call(log),
+                            | Opcode::STOP
+                            | Opcode::REVERT => self.parse_call(log),
                             _ => None,
                         }
                     }
@@ -162,21 +164,20 @@ impl<T: Into<TypedTransaction> + Clone, I: ContractIdentifier> CFG<T, I> {
                 ..
             } if jump == &Jump::In || jump == &Jump::Out => {
                 let enter = jump == &Jump::In;
-                let source_code = self.identifier.get_source_code(&contract_key, index)?;
-                let dest = log.stack.as_ref()?.last()?.as_usize();
+                let (name, input, output) = {
+                    let source_code = self.identifier.get_source_code(&contract_key, index)?;
+                    let dest = log.stack.as_ref()?.last()?.as_usize();
 
-                // Enter a function, parse the input abi of the target function
-                // Exit a function, parse the output abi of the current function
-                let el = if enter {
-                    source_map.get(*pc_ic_map.get(&dest)?)?
-                } else {
-                    element
-                };
+                    // Enter a function, parse the input abi of the target function
+                    // Exit a function, parse the output abi of the current function
+                    let el = if enter {
+                        source_map.get(*pc_ic_map.get(&dest)?)?
+                    } else {
+                        element
+                    };
 
-                let f = source_code.get(el.offset..el.offset + el.length)?;
-                let (name, input, output) = self.parse_fn_data(f, log, enter).map_or_else(
-                    || ("unknown".to_string(), None, None),
-                    |(name, data)| {
+                    let f = source_code.get(el.offset..el.offset + el.length)?;
+                    self.parse_fn_data(f, log, enter).map(|(name, data)| {
                         let data = data.filter(|d| !d.is_empty());
 
                         if jump == &Jump::In {
@@ -184,8 +185,9 @@ impl<T: Into<TypedTransaction> + Clone, I: ContractIdentifier> CFG<T, I> {
                         } else {
                             (name, None, data)
                         }
-                    },
-                );
+                    })
+                }
+                .unwrap_or(("unknown".to_string(), None, None));
 
                 Some(Node {
                     enter,
@@ -228,82 +230,90 @@ impl<T: Into<TypedTransaction> + Clone, I: ContractIdentifier> CFG<T, I> {
             param_str
         };
 
-        let mut stack = log.stack.as_ref()?.iter().rev();
-        let _dest = stack.next()?;
-        let mut parse_err = false;
-        let data = param_str
-            .split(',')
-            .filter(|s| !s.is_empty())
-            .filter_map(|param| {
-                let data = {
-                    let data = stack.next()?;
-                    if param.contains("memory") || param.contains("calldata") {
-                        let str = if param.contains("memory") {
-                            log.memory.as_ref()?.join("")
-                        } else {
-                            self.call_stack.last()?.data.clone()?
-                        };
-
-                        let pointer = ((data.as_usize() + 32) as u64).encode_hex()[2..].to_owned();
-                        Vec::from_hex(pointer + &str).ok()
-                    } else {
-                        Some(data.encode())
-                    }
-                };
-
-                data.map_or_else(
-                    || {
-                        parse_err = true;
-                        None
-                    },
-                    |data| Some(data),
-                )
-            })
-            .flatten()
-            .collect::<Vec<u8>>();
+        let mut stack = log.stack.clone()?;
+        let _dest = stack.pop()?;
+        let memory = &log.memory.as_ref()?.join("");
+        let calldata = self.call_stack.last()?.data.as_ref()?;
+        let _storage = log.storage.as_ref()?;
+        let param_str = param_str.split(',').rev().collect::<Vec<_>>();
 
         let f = AbiParser::default().parse_function(&f).ok()?;
-        let name = f.name;
-        if parse_err {
-            return Some((name, None));
-        }
         let param = if input { f.inputs } else { f.outputs };
-        let mut name_offset = 0;
-        let (names, types): (Vec<String>, Vec<ParamType>) = param
-            .into_iter()
-            .rev()
-            .map(|param| {
-                (
-                    // default variable name for output
-                    if param.name.is_empty() {
-                        name_offset += 1;
-                        name_offset.to_string()
+        let mut param_name_offset = 0;
+        let data: Result<BTreeMap<String, Token>> =
+            param
+                .into_iter()
+                .rev()
+                .enumerate()
+                .try_fold(BTreeMap::new(), |mut acc, (i, param)| {
+                    // default param name for output
+                    let name = if param.name.is_empty() {
+                        param_name_offset += 1;
+                        param_name_offset.to_string()
                     } else {
                         param.name
-                    },
-                    param.kind,
-                )
-            })
-            .unzip();
-        let tokens = decode(types.as_ref(), &data).ok()?;
-        let data = names
-            .into_iter()
-            .zip(tokens.into_iter())
-            .map(|token| token)
-            .collect::<BTreeMap<_, _>>();
+                    };
+                    let param_str = param_str
+                        .get(i)
+                        .ok_or(anyhow!("no corresponding param_str"))?;
+                    let data = stack.pop().ok_or(anyhow!("no corresponding data"))?;
 
-        Some((name, Some(data)))
+                    let data = if param_str.contains("memory") {
+                        let data = match param.kind.clone() {
+                            // offset is 0
+                            ParamType::FixedArray(_, _) | ParamType::FixedBytes(_) => {
+                                memory[data.as_usize() * 2..].to_string()
+                            }
+                            _ => {
+                                let pointer = (data + 32).encode_hex()[2..].to_owned();
+                                pointer + memory
+                            }
+                        };
+                        decode(&[param.kind], &Vec::from_hex(data)?)?
+                    } else if param_str.contains("calldata") {
+                        let data = match param.kind.clone() {
+                            // offset is 0
+                            ParamType::FixedArray(_, _) | ParamType::FixedBytes(_) => {
+                                calldata[data.as_usize() * 2..].to_string()
+                            }
+                            typ => {
+                                let data = match typ {
+                                    // These types have an unused length
+                                    ParamType::Array(_) | ParamType::Bytes | ParamType::String => {
+                                        stack.pop().ok_or(anyhow!("no corresponding data"))?
+                                    }
+                                    _ => data,
+                                };
+                                let pointer = data.encode_hex()[2..].to_owned();
+                                pointer + calldata
+                            }
+                        };
+                        decode(&[param.kind], &Vec::from_hex(data)?)?
+                    } else if param_str.contains("storage") {
+                        // we need to implement all types of parsing, not supported yet
+                        Err(anyhow!("no support parse storage data"))?
+                    } else {
+                        decode(&[param.kind], &data.encode())?
+                    }
+                    .pop()
+                    .ok_or(anyhow!("decode param data err"))?;
+
+                    acc.insert(name, data);
+                    Ok(acc)
+                });
+
+        Some((f.name, data.ok()))
     }
 
     fn parse_call(&mut self, log: &StructLog) -> Option<Node> {
         let opcode = log.op.parse::<Opcode>().ok()?;
-        let mut stack = log.stack.as_ref()?.into_iter().rev();
+        let mut stack = log.stack.clone()?;
         let (enter, address, value) = match opcode {
             Opcode::CALL | Opcode::DELEGATECALL | Opcode::STATICCALL => {
-                let _gas = stack.next()?.as_u64();
-                let address = self.parse_call_addr(stack.next()?)?;
+                let _gas = stack.pop()?.as_u64();
+                let address = self.parse_call_addr(&stack.pop()?)?;
                 let value = if opcode == Opcode::CALL {
-                    Some(stack.next()?.clone())
+                    Some(stack.pop()?.clone())
                 } else {
                     None
                 };
@@ -320,8 +330,8 @@ impl<T: Into<TypedTransaction> + Clone, I: ContractIdentifier> CFG<T, I> {
         let (input, output) = match opcode {
             Opcode::STOP => (None, None),
             _ => {
-                let offset = stack.next()?.as_usize() * 2;
-                let length = stack.next()?.as_usize() * 2;
+                let offset = stack.pop()?.as_usize() * 2;
+                let length = stack.pop()?.as_usize() * 2;
                 let data = log
                     .memory
                     .as_ref()?
@@ -330,7 +340,7 @@ impl<T: Into<TypedTransaction> + Clone, I: ContractIdentifier> CFG<T, I> {
                     .map(|data| data.to_string());
 
                 let token = self.parse_call_data(data.clone());
-                if opcode == Opcode::RETURN {
+                if opcode == Opcode::RETURN || opcode == Opcode::REVERT {
                     (None, token)
                 } else {
                     self.call_stack.push(CallStack {
@@ -383,7 +393,7 @@ impl<T: Into<TypedTransaction> + Clone, I: ContractIdentifier> CFG<T, I> {
                 stack.push((node, index));
             } else {
                 let exit = node;
-                let (mut enter, enter_index) = stack.pop().ok_or(anyhow!("nodes do not match"))?;
+                let (mut enter, enter_index) = stack.pop().ok_or(anyhow!("missing start node"))?;
 
                 // merge enter && exit node
                 enter.output = exit.output;
