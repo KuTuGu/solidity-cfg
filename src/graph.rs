@@ -1,23 +1,52 @@
-use super::parse::Node;
 use anyhow::{anyhow, Result};
+use ethers::abi::Token;
 use ethers::prelude::*;
 use petgraph::dot::Dot;
 use petgraph::graph::DiGraph;
 use petgraph::graph::NodeIndex;
 use petgraph::Graph;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::{fs::File, io::Write, path::Path};
 
+#[derive(Debug, Clone)]
+pub struct Node {
+    pub enter: bool,
+    pub name: Option<String>,
+    pub address: Address,
+    pub depth: u64,
+    pub op: Opcode,
+    pub value: Option<U256>,
+    pub input: Option<BTreeMap<String, Token>>,
+    pub output: Option<BTreeMap<String, Token>>,
+    pub gas: Gas,
+}
+
+impl Node {
+    fn is_jump(&self) -> bool {
+        self.op == Opcode::JUMP
+    }
+    fn is_call(&self) -> bool {
+        !self.is_jump()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Gas {
+    pub gas_used: u64,
+    pub gas_left: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct JumpNode {
+pub struct JumpID {
     name: String,
     address: Address,
     depth: u64,
 }
 
-impl From<&Node> for JumpNode {
+impl From<&Node> for JumpID {
     fn from(node: &Node) -> Self {
         Self {
             name: node.name.clone().unwrap(),
@@ -34,8 +63,8 @@ pub fn parse_graph(list: Vec<Node>) -> Result<Graph<Node, ()>> {
     list.into_iter()
         .try_fold(DiGraph::new(), |mut graph, node| {
             if node.enter {
-                if node.op == Opcode::JUMP {
-                    *enter_jump_map.entry(JumpNode::from(&node)).or_insert(0_u32) += 1;
+                if node.is_jump() {
+                    *enter_jump_map.entry(JumpID::from(&node)).or_insert(0_u32) += 1;
                 }
                 let index = graph.add_node(node.clone());
                 stack
@@ -44,42 +73,41 @@ pub fn parse_graph(list: Vec<Node>) -> Result<Graph<Node, ()>> {
                 stack.push((node, index));
             } else {
                 let exit = node;
-                if let Some((mut enter, enter_index)) = match exit.op {
-                    Opcode::JUMP => {
-                        let exit_jump_node = JumpNode::from(&exit);
-                        match enter_jump_map.get(&exit_jump_node) {
-                            Some(e) if e > &0 => loop {
-                                let node = stack.pop().ok_or(anyhow!("missing enter jump"))?;
-                                match node.0.op {
-                                    Opcode::JUMP => {
-                                        enter_jump_map
-                                            .entry(JumpNode::from(&node.0))
-                                            .and_modify(|c| *c = c.saturating_sub(1));
-                                        if exit_jump_node == JumpNode::from(&node.0) {
-                                            break Some(node);
-                                        }
-                                    }
-                                    _ => Err(anyhow!("missing enter jump"))?,
+                if let Some((mut enter, enter_index)) = if exit.is_jump() {
+                    let exit_jump_node = JumpID::from(&exit);
+                    match enter_jump_map.get(&exit_jump_node) {
+                        Some(&cnt) if cnt > 0 => loop {
+                            let node = stack.pop().ok_or(anyhow!("missing enter jump"))?;
+                            if node.0.is_jump() {
+                                enter_jump_map
+                                    .entry(JumpID::from(&node.0))
+                                    .and_modify(|c| *c = c.saturating_sub(1));
+                                if exit_jump_node == JumpID::from(&node.0) {
+                                    break Some(node);
                                 }
-                            },
-                            _ => None,
+                            } else {
+                                // fail if out of call boundary
+                                Err(anyhow!("missing enter jump"))?
+                            }
+                        },
+                        _ => None,
+                    }
+                } else {
+                    loop {
+                        let node = stack.pop().ok_or(anyhow!("missing enter call"))?;
+                        if node.0.is_call() {
+                            if node.0.address == exit.address && node.0.enter {
+                                break Some(node);
+                            } else {
+                                // fail if mismatch call node
+                                Err(anyhow!("missing enter call"))?
+                            }
+                        } else {
+                            enter_jump_map
+                                .entry(JumpID::from(&node.0))
+                                .and_modify(|c| *c = c.saturating_sub(1));
                         }
                     }
-                    _ => loop {
-                        let node = stack.pop().ok_or(anyhow!("missing enter call"))?;
-                        match node.0.op {
-                            Opcode::CALL | Opcode::DELEGATECALL | Opcode::STATICCALL
-                                if node.0.address == exit.address && node.0.enter =>
-                            {
-                                break Some(node);
-                            }
-                            _ => {
-                                enter_jump_map
-                                    .entry(JumpNode::from(&node.0))
-                                    .and_modify(|c| *c = c.saturating_sub(1));
-                            }
-                        }
-                    },
                 } {
                     // merge enter && exit node
                     enter.output = exit.output;

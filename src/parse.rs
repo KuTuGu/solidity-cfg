@@ -1,4 +1,4 @@
-use crate::ContractIdentifier;
+use crate::{ContractIdentifier, Gas, Node};
 use anyhow::{anyhow, Error, Result};
 use ethers::abi::{decode, AbiEncode, AbiParser, ParamType, Token};
 use ethers::prelude::k256::ecdsa::SigningKey;
@@ -9,25 +9,6 @@ use ethers::utils::hex::FromHex;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::sync::Arc;
-
-#[derive(Debug, Clone)]
-pub struct Node {
-    pub enter: bool,
-    pub name: Option<String>,
-    pub address: Address,
-    pub depth: u64,
-    pub op: Opcode,
-    pub value: Option<U256>,
-    pub input: Option<BTreeMap<String, Token>>,
-    pub output: Option<BTreeMap<String, Token>>,
-    pub gas: Gas,
-}
-
-#[derive(Debug, Clone)]
-pub struct Gas {
-    pub gas_used: u64,
-    pub gas_left: u64,
-}
 
 #[derive(Debug, Clone)]
 pub struct CallStack {
@@ -173,7 +154,7 @@ impl<T: Into<TypedTransaction> + Clone, I: ContractIdentifier> CFG<T, I> {
                 let f = source_code.get(el.offset..el.offset + el.length)?;
                 let (name, input, output) =
                     self.parse_fn_data(f, log, enter).map(|(name, data)| {
-                        if jump == &Jump::In {
+                        if enter {
                             (name, Some(data), None)
                         } else {
                             (name, None, Some(data))
@@ -329,11 +310,11 @@ impl<T: Into<TypedTransaction> + Clone, I: ContractIdentifier> CFG<T, I> {
                     .map(|data| data.to_string());
 
                 let token = self.parse_call_data(data.clone());
-                if opcode == Opcode::RETURN || opcode == Opcode::REVERT {
-                    (None, token)
-                } else {
+                if enter {
                     self.call_stack.push(CallStack { address, data });
                     (token, None)
+                } else {
+                    (None, token)
                 }
             }
         };
