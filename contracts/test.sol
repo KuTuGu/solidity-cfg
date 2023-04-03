@@ -17,6 +17,13 @@ contract A is Test {
         for (uint i; i < 2; ++i) {
             _mid(_add(_a, _b));
         }
+
+        uint[] memory dynArr = new uint[](3);
+        dynArr[0] = 1;
+        dynArr[1] = 2;
+        dynArr[2] = 3;
+        uint256[3] memory fixedArr = [uint256(7), uint256(8), uint256(9)];
+        this._calldata(fixedArr, bytes32("0x456"), dynArr, "123456");
     }
 
     function _mid(uint _a) internal out(_a) {
@@ -32,6 +39,22 @@ contract A is Test {
         d.d(_c);
         o.o(_c);
     }
+
+    function _calldata(
+        uint[3] calldata _a,
+        bytes32 _b,
+        uint[] calldata _c,
+        string calldata _d
+    ) external {
+        _memory(_a, bytes("0x1234"), _c, _d);
+    }
+
+    function _memory(
+        uint[3] memory _a,
+        bytes memory _b,
+        uint[] memory _c,
+        string memory _d
+    ) internal {}
 }
 
 interface ID {
