@@ -8,8 +8,7 @@ use ethers::solc::{
     ProjectCompileOutput,
 };
 use futures::stream::StreamExt;
-use revm::interpreter::{opcode, spec_opcode_gas};
-use revm::primitives::SpecId;
+use revm::{opcode, spec_opcode_gas, SpecId};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};

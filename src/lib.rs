@@ -19,7 +19,7 @@ mod tests {
 
     abigen!(TestContract, r#"[function entry(uint _a, uint _b)]"#);
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_it_works() {
         let anvil = Anvil::new().port(8545_u16).timeout(20000_000_u64).spawn();
         let wallet: LocalWallet = anvil.keys()[0].clone().into();
