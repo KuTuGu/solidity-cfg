@@ -84,7 +84,7 @@ impl ContractIdentifier for OnlineContractIdentifier {
                         .into_iter()
                         .next()
                         .filter(|meta| !meta.is_vyper())
-                        .and_then(|meta| Some((addr, meta)))
+                        .map(|meta| (addr, meta))
                 } else {
                     // contract not verified / network problem
                     None
@@ -292,12 +292,7 @@ impl ContractIdentifier for LocalContractIdentifier {
 
         self.source_code = sources
             .into_sources()
-            .map(|(path, source)| {
-                (
-                    source.id,
-                    fs::read_to_string(&self.root.join(&path)).unwrap(),
-                )
-            })
+            .map(|(path, source)| (source.id, fs::read_to_string(self.root.join(path)).unwrap()))
             .collect::<BTreeMap<_, _>>();
         self.source_map = artifacts
             .into_iter()

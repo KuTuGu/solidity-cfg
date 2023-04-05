@@ -127,8 +127,8 @@ impl<T: Into<TypedTransaction> + Clone, I: ContractIdentifier> CFG<T, I> {
         // if no source, the contract is not verified, just return
         let contract = self.call_stack.last()?.address;
         let contract_key = self.identifier.get_contract_key(contract)?;
-        let source_map = self.identifier.get_source_map(&contract_key)?;
-        let pc_ic_map = self.identifier.get_pc_ic_map(&contract_key)?;
+        let source_map = self.identifier.get_source_map(contract_key)?;
+        let pc_ic_map = self.identifier.get_pc_ic_map(contract_key)?;
         let pc = log.pc as usize;
         let ic = *pc_ic_map.get(&pc)?;
         let element = source_map.get(ic)?;
@@ -141,7 +141,7 @@ impl<T: Into<TypedTransaction> + Clone, I: ContractIdentifier> CFG<T, I> {
             } if jump == &Jump::In || jump == &Jump::Out => {
                 let enter = jump == &Jump::In;
                 let dest = log.stack.as_ref()?.last()?.as_usize();
-                let source_code = self.identifier.get_source_code(&contract_key, index)?;
+                let source_code = self.identifier.get_source_code(contract_key, index)?;
 
                 // Enter a function, parse the input abi of the target function
                 // Exit a function, parse the output abi of the current function
@@ -186,7 +186,7 @@ impl<T: Into<TypedTransaction> + Clone, I: ContractIdentifier> CFG<T, I> {
         log: &StructLog,
         input: bool,
     ) -> Option<(String, BTreeMap<String, Token>)> {
-        let (f, _body) = f.split_once("{")?.to_owned();
+        let (f, _body) = f.split_once('{')?.to_owned();
         let mut f = f.to_string();
         // need to deal with irregular abi case where modifier exists and no returns
         if !f.contains(" returns ") {
@@ -229,7 +229,7 @@ impl<T: Into<TypedTransaction> + Clone, I: ContractIdentifier> CFG<T, I> {
                 let data = stack.pop().ok_or(anyhow!("no corresponding data"))?;
 
                 let data = if param_str.contains("memory") {
-                    let data = match param.kind.clone() {
+                    let data = match param.kind {
                         // offset is 0
                         ParamType::FixedArray(_, _) | ParamType::FixedBytes(_) => {
                             memory[data.as_usize() * 2..].to_string()
@@ -284,7 +284,7 @@ impl<T: Into<TypedTransaction> + Clone, I: ContractIdentifier> CFG<T, I> {
                 let _gas = stack.pop()?.as_u64();
                 let address = self.parse_call_addr(&stack.pop()?)?;
                 let value = if opcode == Opcode::CALL {
-                    Some(stack.pop()?.clone())
+                    Some(stack.pop()?)
                 } else {
                     None
                 };

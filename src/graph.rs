@@ -40,7 +40,7 @@ pub struct Gas {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct JumpID {
+struct JumpID {
     name: String,
     address: Address,
     depth: u64,
@@ -69,7 +69,7 @@ pub fn parse_graph(list: Vec<Node>) -> Result<Graph<Node, ()>> {
                 let index = graph.add_node(node.clone());
                 stack
                     .last()
-                    .map(|(.., parent_index)| graph.add_edge(parent_index.clone(), index, ()));
+                    .map(|(.., parent_index)| graph.add_edge(*parent_index, index, ()));
                 stack.push((node, index));
             } else {
                 let exit = node;
@@ -77,31 +77,29 @@ pub fn parse_graph(list: Vec<Node>) -> Result<Graph<Node, ()>> {
                     let exit_jump_node = JumpID::from(&exit);
                     match enter_jump_map.get(&exit_jump_node) {
                         Some(&cnt) if cnt > 0 => loop {
-                            let node = stack.pop().ok_or(anyhow!("missing enter jump"))?;
-                            if node.0.is_jump() {
-                                enter_jump_map
-                                    .entry(JumpID::from(&node.0))
-                                    .and_modify(|c| *c = c.saturating_sub(1));
-                                if exit_jump_node == JumpID::from(&node.0) {
-                                    break Some(node);
-                                }
-                            } else {
-                                // fail if out of call boundary
-                                Err(anyhow!("missing enter jump"))?
+                            let node = stack
+                                .pop()
+                                .filter(|(node, _i)| node.is_jump())
+                                .ok_or(anyhow!("missing enter jump"))?;
+                            enter_jump_map
+                                .entry(JumpID::from(&node.0))
+                                .and_modify(|c| *c = c.saturating_sub(1));
+                            if exit_jump_node == JumpID::from(&node.0) {
+                                break Some(node);
                             }
                         },
                         _ => None,
                     }
                 } else {
                     loop {
-                        let node = stack.pop().ok_or(anyhow!("missing enter call"))?;
+                        let node = stack
+                            .pop()
+                            .filter(|(node, _i)| {
+                                node.is_jump() || (node.address == exit.address && node.enter)
+                            })
+                            .ok_or(anyhow!("missing enter call"))?;
                         if node.0.is_call() {
-                            if node.0.address == exit.address && node.0.enter {
-                                break Some(node);
-                            } else {
-                                // fail if mismatch call node
-                                Err(anyhow!("missing enter call"))?
-                            }
+                            break Some(node);
                         } else {
                             enter_jump_map
                                 .entry(JumpID::from(&node.0))
