@@ -1,21 +1,26 @@
-use anyhow::{anyhow, Result};
+use crate::SignerClient;
+use anyhow::{anyhow, Error, Result};
 use async_trait::async_trait;
+use ethers::abi::HumanReadableParser;
+use ethers::abi::ParamType;
+use ethers::abi::StateMutability;
 use ethers::etherscan::contract::Metadata;
 use ethers::prelude::*;
+use ethers::solc::artifacts::ast::NodeType;
+use ethers::solc::artifacts::LowFidelitySourceLocation as PartialSourceLocation;
+use ethers::solc::artifacts::Node;
+use ethers::solc::artifacts::{Ast, StorageLocation};
 use ethers::solc::remappings::Remapping;
-use ethers::solc::{
-    artifacts::contract::CompactContractBytecode, sourcemap::SourceMap, Artifact,
-    ProjectCompileOutput,
-};
+use ethers::solc::sourcemap::SourceElement;
+use ethers::solc::{sourcemap::SourceMap, Artifact, ProjectCompileOutput};
 use futures::stream::StreamExt;
 use revm::{opcode, spec_opcode_gas, SpecId};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{collections::BTreeMap, fs};
-
-use crate::SignerClient;
 
 #[async_trait]
 pub trait ContractIdentifier {
@@ -23,37 +28,16 @@ pub trait ContractIdentifier {
 
     async fn build(&mut self, list: Vec<Address>) -> Result<()>;
 
-    fn get_label(&self, _key: Address) -> Option<String> {
-        None
-    }
+    fn get_label(&self, contract: Address) -> Option<String>;
 
-    fn get_contract_key(&self, key: Address) -> Option<&Self::Key>;
-
-    // The unit is file
-    // source_index -> source_code
-    fn get_source_code(&self, key: &Self::Key, i: &u32) -> Option<&String>;
-
-    // The unit is contract (
-    //   may be larger than files, such as import other files;
-    //   may also be smaller than a file, such as a file with multiple contracts
-    // )
-    // key -> (source_map, pc_ic_map)
-    fn get_source_map(&self, key: &Self::Key) -> Option<&SourceMap>;
-    fn get_pc_ic_map(&self, key: &Self::Key) -> Option<&PCICMap>;
+    fn get_artifact(&self, contract: Address) -> Option<&ContractArtifact>;
 }
 
 #[derive(Debug)]
 pub struct OnlineContractIdentifier {
     client: Arc<Client>,
     contract_meta: BTreeMap<Address, Metadata>,
-    contract_source: BTreeMap<String, ContractSourceSome>,
-}
-
-#[derive(Debug)]
-struct ContractSourceSome {
-    source_code: BTreeMap<u32, String>,
-    source_map: SourceMap,
-    pc_ic_map: PCICMap,
+    contract_source: BTreeMap<Address, ContractArtifact>,
 }
 
 impl OnlineContractIdentifier {
@@ -106,9 +90,8 @@ impl ContractIdentifier for OnlineContractIdentifier {
         .into_iter();
 
         while let Some((addr, meta, Ok(source))) = result.next() {
-            let name = meta.contract_name.clone();
             self.contract_meta.insert(addr, meta);
-            self.contract_source.insert(name, source);
+            self.contract_source.insert(addr, source);
         }
 
         Ok(())
@@ -118,28 +101,13 @@ impl ContractIdentifier for OnlineContractIdentifier {
         Some(self.contract_meta.get(&key)?.contract_name.clone())
     }
 
-    fn get_contract_key(&self, key: Address) -> Option<&Self::Key> {
-        self.contract_meta.get(&key)
-    }
-
-    fn get_source_code(&self, key: &Self::Key, i: &u32) -> Option<&String> {
-        self.contract_source
-            .get(&key.contract_name)?
-            .source_code
-            .get(i)
-    }
-
-    fn get_source_map(&self, key: &Self::Key) -> Option<&SourceMap> {
-        Some(&self.contract_source.get(&key.contract_name)?.source_map)
-    }
-
-    fn get_pc_ic_map(&self, key: &Self::Key) -> Option<&PCICMap> {
-        Some(&self.contract_source.get(&key.contract_name)?.pc_ic_map)
+    fn get_artifact(&self, contract: Address) -> Option<&ContractArtifact> {
+        self.contract_source.get(&contract)
     }
 }
 
 /// Creates and compiles a project from an Etherscan source.
-async fn compile_from_source(metadata: &Metadata) -> Result<ContractSourceSome> {
+async fn compile_from_source(metadata: &Metadata) -> Result<ContractArtifact> {
     let root = tempfile::tempdir()?;
     let root_path = root.path();
     let project = etherscan_project(metadata, root_path)?;
@@ -157,29 +125,20 @@ async fn compile_from_source(metadata: &Metadata) -> Result<ContractSourceSome> 
             Some((source.id, fs::read_to_string(root_path.join(path)).ok()?))
         })
         .collect::<BTreeMap<_, _>>();
-    let (source_map, pc_ic_map) = artifacts
+    let contract_artifact = artifacts
         .into_iter()
         .find_map(|(id, artifact)| {
             if id.name == metadata.contract_name {
-                let artifact = CompactContractBytecode::from(artifact);
-                let source_map = artifact.get_source_map_deployed()?.ok()?;
-                let bytecode = artifact.get_deployed_bytecode_bytes()?;
-                let pc_ic_map = build_pc_ic_map(SpecId::LATEST, &bytecode);
-
-                Some((source_map, pc_ic_map))
+                ContractArtifact::try_from(artifact).ok()
             } else {
                 None
             }
         })
-        .ok_or(anyhow!("no source some"))?;
+        .ok_or(anyhow!("no source some"));
 
     root.close()?;
 
-    Ok(ContractSourceSome {
-        source_code,
-        source_map,
-        pc_ic_map,
-    })
+    contract_artifact
 }
 
 /// Creates a [Project] from an Etherscan source.
@@ -237,7 +196,7 @@ pub struct LocalContractIdentifier {
     pub project: Option<ProjectCompileOutput>,
     bytecode: BTreeMap<Address, Bytes>,
     source_code: BTreeMap<u32, String>,
-    source_map: HashMap<Bytes, (SourceMap, PCICMap)>,
+    contract_artifact: HashMap<Bytes, ContractArtifact>,
 }
 
 impl LocalContractIdentifier {
@@ -260,7 +219,7 @@ impl LocalContractIdentifier {
                 project: Some(project),
                 bytecode: BTreeMap::new(),
                 source_code: BTreeMap::new(),
-                source_map: HashMap::new(),
+                contract_artifact: HashMap::new(),
             })
         }
     }
@@ -289,40 +248,197 @@ impl ContractIdentifier for LocalContractIdentifier {
         .filter_map(|(addr, code)| Some((addr, code.ok()?)))
         .collect::<BTreeMap<Address, Bytes>>();
 
-        self.source_code = sources
+        let source_code = sources
             .into_sources()
             .map(|(path, source)| (source.id, fs::read_to_string(self.root.join(path)).unwrap()))
             .collect::<BTreeMap<_, _>>();
-        self.source_map = artifacts
+        self.contract_artifact = artifacts
             .into_iter()
             .filter_map(|(_id, artifact)| {
-                let artifact = CompactContractBytecode::from(artifact);
-                let source_map = artifact.get_source_map_deployed()?.ok()?;
-                let bytecode = artifact.get_deployed_bytecode_bytes()?;
-                let pc_ic_map = build_pc_ic_map(SpecId::LATEST, &bytecode);
-
-                Some((bytecode.into_owned(), (source_map, pc_ic_map)))
+                let bytecode = artifact.get_deployed_bytecode_bytes()?.into_owned();
+                let artifact = ContractArtifact::try_from(artifact).ok()?;
+                Some((bytecode, artifact))
             })
             .collect::<HashMap<_, _>>();
 
         Ok(())
     }
 
-    fn get_contract_key(&self, key: Address) -> Option<&Self::Key> {
-        self.bytecode.get(&key)
+    fn get_label(&self, _contract: Address) -> Option<String> {
+        None
     }
 
-    fn get_source_code(&self, _key: &Self::Key, i: &u32) -> Option<&String> {
-        self.source_code.get(i)
+    fn get_artifact(&self, contract: Address) -> Option<&ContractArtifact> {
+        Some(self.contract_artifact.get(self.bytecode.get(&contract)?)?)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct SourceLocation {
+    start: usize,
+    length: usize,
+    index: usize,
+}
+
+impl TryFrom<&SourceElement> for SourceLocation {
+    type Error = Error;
+
+    fn try_from(el: &SourceElement) -> Result<Self> {
+        Ok(Self {
+            start: el.offset,
+            length: el.length,
+            index: el
+                .index
+                .map(|i| i as usize)
+                .ok_or(anyhow!("no source index"))?,
+        })
+    }
+}
+
+impl TryFrom<&PartialSourceLocation> for SourceLocation {
+    type Error = Error;
+
+    fn try_from(loc: &PartialSourceLocation) -> Result<Self> {
+        Ok(Self {
+            start: loc.start,
+            length: loc.length.ok_or(anyhow!("no length"))?,
+            index: loc.index.ok_or(anyhow!("no source index"))?,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct StorageLocationFunction {
+    pub name: String,
+    pub inputs: Vec<StorageLocationParam>,
+    pub outputs: Vec<StorageLocationParam>,
+    pub state_mutability: StateMutability,
+}
+
+#[derive(Debug)]
+pub struct StorageLocationParam {
+    pub name: String,
+    pub kind: ParamType,
+    pub internal_type: Option<String>,
+    pub storage_location: StorageLocation,
+}
+
+#[derive(Debug)]
+pub struct ContractArtifact {
+    pub source_map: SourceMap,
+    pub pc_ic_map: PCICMap,
+    pub pos_fn_map: HashMap<SourceLocation, StorageLocationFunction>,
+}
+
+impl TryFrom<ConfigurableContractArtifact> for ContractArtifact {
+    type Error = Error;
+    fn try_from(artifacts: ConfigurableContractArtifact) -> Result<Self> {
+        let source_map = artifacts
+            .get_source_map_deployed()
+            .ok_or(anyhow!("no source_map"))??;
+        let bytecode = artifacts
+            .get_deployed_bytecode_bytes()
+            .ok_or(anyhow!("no bytecode"))?;
+        let pc_ic_map = build_pc_ic_map(SpecId::LATEST, &bytecode);
+        let ast = artifacts.ast.ok_or(anyhow!("no ast"))?;
+        let pos_fn_map = build_fn_map(&ast);
+
+        Ok(Self {
+            source_map,
+            pc_ic_map,
+            pos_fn_map,
+        })
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ASTFunction {
+    name: String,
+    parameters: ParameterList,
+    return_parameters: ParameterList,
+    state_mutability: StateMutability,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ParameterList {
+    parameters: Vec<Parameter>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Parameter {
+    name: String,
+    storage_location: StorageLocation,
+    type_descriptions: ParameterTypeDescription,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ParameterTypeDescription {
+    type_identifier: String,
+    type_string: String,
+}
+
+impl TryInto<StorageLocationFunction> for ASTFunction {
+    type Error = Error;
+    fn try_into(self) -> Result<StorageLocationFunction> {
+        let inputs = parse_param_list(self.parameters.parameters)?;
+        let outputs = parse_param_list(self.return_parameters.parameters)?;
+
+        fn parse_param_list(param_list: Vec<Parameter>) -> Result<Vec<StorageLocationParam>> {
+            param_list.into_iter().try_fold(vec![], |mut acc, param| {
+                acc.push(StorageLocationParam {
+                    name: param.name,
+                    kind: HumanReadableParser::parse_type(&param.type_descriptions.type_string)?,
+                    internal_type: None,
+                    storage_location: param.storage_location,
+                });
+                Ok(acc)
+            })
+        }
+
+        Ok(StorageLocationFunction {
+            name: self.name,
+            inputs,
+            outputs,
+            state_mutability: self.state_mutability,
+        })
+    }
+}
+
+fn build_fn_map(ast: &Ast) -> HashMap<SourceLocation, StorageLocationFunction> {
+    fn parse_fn(node: &Node) -> Option<(SourceLocation, StorageLocationFunction)> {
+        let f: ASTFunction =
+            serde_json::from_str(&serde_json::to_string(&node.other).ok()?).ok()?;
+
+        Some((
+            SourceLocation::try_from(&node.src).ok()?,
+            f.try_into().ok()?,
+        ))
     }
 
-    fn get_source_map(&self, key: &Self::Key) -> Option<&SourceMap> {
-        Some(&self.source_map.get(key)?.0)
-    }
-
-    fn get_pc_ic_map(&self, key: &Self::Key) -> Option<&PCICMap> {
-        Some(&self.source_map.get(key)?.1)
-    }
+    ast.nodes
+        .iter()
+        .filter_map(|node| match node.node_type {
+            NodeType::FunctionDefinition => Some(vec![parse_fn(node)?]),
+            NodeType::ContractDefinition => Some(
+                node.nodes
+                    .iter()
+                    .filter_map(|node| {
+                        if node.node_type == NodeType::FunctionDefinition {
+                            Some(parse_fn(node)?)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        })
+        .flatten()
+        .collect::<HashMap<SourceLocation, StorageLocationFunction>>()
 }
 
 /// A map of program counters to instruction counters.

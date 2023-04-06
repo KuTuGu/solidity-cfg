@@ -1,8 +1,10 @@
-use crate::{ContractIdentifier, Gas, Node};
+use crate::StorageLocationFunction;
+use crate::{identifier::SourceLocation, ContractArtifact, ContractIdentifier, Gas, Node};
 use anyhow::{anyhow, Error, Result};
-use ethers::abi::{decode, AbiEncode, AbiParser, ParamType, Token};
+use ethers::abi::{decode, AbiEncode, ParamType, Token};
 use ethers::prelude::k256::ecdsa::SigningKey;
 use ethers::prelude::*;
+use ethers::solc::artifacts::StorageLocation;
 use ethers::solc::sourcemap::{Jump, SourceElement};
 use ethers::types::transaction::eip2718::TypedTransaction;
 use ethers::utils::hex::FromHex;
@@ -126,9 +128,12 @@ impl<T: Into<TypedTransaction> + Clone, I: ContractIdentifier> CFG<T, I> {
     fn parse_fn(&self, log: &StructLog) -> Option<Node> {
         // if no source, the contract is not verified, just return
         let contract = self.call_stack.last()?.address;
-        let contract_key = self.identifier.get_contract_key(contract)?;
-        let source_map = self.identifier.get_source_map(contract_key)?;
-        let pc_ic_map = self.identifier.get_pc_ic_map(contract_key)?;
+        let ContractArtifact {
+            source_map,
+            pc_ic_map,
+            pos_fn_map,
+        } = self.identifier.get_artifact(contract)?;
+
         let pc = log.pc as usize;
         let ic = *pc_ic_map.get(&pc)?;
         let element = source_map.get(ic)?;
@@ -136,30 +141,18 @@ impl<T: Into<TypedTransaction> + Clone, I: ContractIdentifier> CFG<T, I> {
         match element {
             SourceElement {
                 jump,
-                index: Some(index),
+                index: Some(_index),
                 ..
             } if jump == &Jump::In || jump == &Jump::Out => {
                 let enter = jump == &Jump::In;
                 let dest = log.stack.as_ref()?.last()?.as_usize();
-                let source_code = self.identifier.get_source_code(contract_key, index)?;
-
-                // Enter a function, parse the input abi of the target function
-                // Exit a function, parse the output abi of the current function
                 let el = if enter {
                     source_map.get(*pc_ic_map.get(&dest)?)?
                 } else {
                     element
                 };
-
-                let f = source_code.get(el.offset..el.offset + el.length)?;
-                let (name, input, output) =
-                    self.parse_fn_data(f, log, enter).map(|(name, data)| {
-                        if enter {
-                            (name, Some(data), None)
-                        } else {
-                            (name, None, Some(data))
-                        }
-                    })?;
+                let f = pos_fn_map.get(&SourceLocation::try_from(el).ok()?)?;
+                let (name, input, output) = self.parse_fn_data(f, log, enter)?;
 
                 Some(Node {
                     enter,
@@ -182,98 +175,88 @@ impl<T: Into<TypedTransaction> + Clone, I: ContractIdentifier> CFG<T, I> {
 
     fn parse_fn_data(
         &self,
-        f: &str,
+        f: &StorageLocationFunction,
         log: &StructLog,
         input: bool,
-    ) -> Option<(String, BTreeMap<String, Token>)> {
-        let (f, _body) = f.split_once('{')?.to_owned();
-        let mut f = f.to_string();
-        // need to deal with irregular abi case where modifier exists and no returns
-        if !f.contains(" returns ") {
-            f += " returns ()";
-        }
-        let param_str = if input {
-            let (_s, param_str) = f.split_once('(')?;
-            let (param_str, _s) = param_str.split_once(')')?;
-            param_str
-        } else {
-            let (_s, param_str) = f.rsplit_once('(')?;
-            let (param_str, _s) = param_str.rsplit_once(')')?;
-            param_str
-        };
-
+    ) -> Option<(
+        String,
+        Option<BTreeMap<String, Token>>,
+        Option<BTreeMap<String, Token>>,
+    )> {
         let mut stack = log.stack.clone()?;
         let _dest = stack.pop()?;
         let memory = &log.memory.as_ref()?.join("");
         let calldata = self.call_stack.last()?.data.as_ref()?;
-        let param_str = param_str.split(',').rev().collect::<Vec<_>>();
 
-        let f = AbiParser::default().parse_function(&f).ok()?;
-        let param = if input { f.inputs } else { f.outputs };
+        let param_list = if input { &f.inputs } else { &f.outputs };
         let mut param_name_offset = 0;
-        let data = param
-            .into_iter()
+        let data = param_list
+            .iter()
             .rev()
-            .enumerate()
-            .try_fold(BTreeMap::new(), |mut acc, (i, param)| {
+            .try_fold(BTreeMap::new(), |mut acc, param| {
                 // default param name for output
                 let name = if param.name.is_empty() {
                     param_name_offset += 1;
                     param_name_offset.to_string()
                 } else {
-                    param.name
+                    param.name.clone()
                 };
-                let param_str = param_str
-                    .get(i)
-                    .ok_or(anyhow!("no corresponding param_str"))?;
+                let kind = param.kind.clone();
                 let data = stack.pop().ok_or(anyhow!("no corresponding data"))?;
 
-                let data = if param_str.contains("memory") {
-                    let data = match param.kind {
-                        // offset is 0
-                        ParamType::FixedArray(_, _) | ParamType::FixedBytes(_) => {
-                            memory[data.as_usize() * 2..].to_string()
-                        }
-                        _ => {
-                            let pointer = (data + 32).encode_hex()[2..].to_owned();
-                            pointer + memory
-                        }
-                    };
-                    decode(&[param.kind], &Vec::from_hex(data)?)?
-                } else if param_str.contains("calldata") {
-                    let data = match param.kind.clone() {
-                        // offset is 0
-                        ParamType::FixedArray(_, _) | ParamType::FixedBytes(_) => {
-                            calldata[data.as_usize() * 2..].to_string()
-                        }
-                        typ => {
-                            let data = match typ {
-                                // These types have an unused length
-                                ParamType::Array(_) | ParamType::Bytes | ParamType::String => {
-                                    stack.pop().ok_or(anyhow!("no corresponding data"))?
-                                }
-                                _ => data,
-                            };
-                            let pointer = data.encode_hex()[2..].to_owned();
-                            pointer + calldata
-                        }
-                    };
-                    decode(&[param.kind], &Vec::from_hex(data)?)?
-                } else if param_str.contains("storage") {
-                    // we need to implement all types of parsing, not supported yet
-                    Err(anyhow!("no support parse storage data"))?
-                } else {
-                    decode(&[param.kind], &data.encode())?
+                let data = match param.storage_location {
+                    StorageLocation::Default => decode(&[kind], &data.encode())?,
+                    StorageLocation::Memory => {
+                        let data = match param.kind {
+                            // offset is 0
+                            ParamType::FixedArray(_, _) | ParamType::FixedBytes(_) => {
+                                memory[data.as_usize() * 2..].to_string()
+                            }
+                            _ => {
+                                let pointer = (data + 32).encode_hex()[2..].to_owned();
+                                pointer + memory
+                            }
+                        };
+                        decode(&[kind], &Vec::from_hex(data)?)?
+                    }
+                    StorageLocation::Calldata => {
+                        let data = match kind {
+                            // offset is 0
+                            ParamType::FixedArray(_, _) | ParamType::FixedBytes(_) => {
+                                calldata[data.as_usize() * 2..].to_string()
+                            }
+                            ref typ => {
+                                let data = match typ {
+                                    // These types have an unused length
+                                    ParamType::Array(_) | ParamType::Bytes | ParamType::String => {
+                                        stack.pop().ok_or(anyhow!("no corresponding data"))?
+                                    }
+                                    _ => data,
+                                };
+                                let pointer = data.encode_hex()[2..].to_owned();
+                                pointer + calldata
+                            }
+                        };
+                        decode(&[kind], &Vec::from_hex(data)?)?
+                    }
+                    StorageLocation::Storage => {
+                        // we need to implement parsing all types, not supported yet
+                        Err(anyhow!("no support parse storage data"))?
+                    }
                 }
                 .pop()
                 .ok_or(anyhow!("decode param data err"))?;
 
                 acc.insert(name, data);
-                Ok::<BTreeMap<String, Token>, Error>(acc)
+                Ok::<_, Error>(acc)
             })
             .ok()?;
 
-        Some((f.name, data))
+        if input {
+            Some((f.name.clone(), Some(data), None))
+        } else {
+            Some((f.name.clone(), None, Some(data)))
+        }
     }
 
     fn parse_call(&mut self, log: &StructLog) -> Option<Node> {
