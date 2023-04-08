@@ -11,4 +11,6 @@ In this demo, ast analysis is added to the basic analysis of opcode, so as to un
 ## Todo
 
 - [ ] Support contract call abi parsing
-- [ ] Support user-defined type ast parsing
+- [ ] Support user-defined type parsing
+- [ ] Support parsing modifier
+- [ ] Support parsing storage data

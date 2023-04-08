@@ -29,13 +29,7 @@ mod tests {
         let client = Arc::new(client);
 
         let identifier = LocalContractIdentifier::new("contracts", client.clone()).unwrap();
-        let output = identifier
-            .project
-            .as_ref()
-            .unwrap()
-            .find_first("A")
-            .expect("could not find contract")
-            .clone();
+        let output = identifier.find_contract("A").cloned().unwrap();
         let (abi, bytecode, _) = output.into_parts();
         let factory = ContractFactory::new(abi.unwrap(), bytecode.unwrap(), client.clone());
         let contract = factory.deploy(()).unwrap().send().await.unwrap();
